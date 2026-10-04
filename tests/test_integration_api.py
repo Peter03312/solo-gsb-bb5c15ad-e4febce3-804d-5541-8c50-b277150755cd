@@ -12,6 +12,7 @@ import os
 import threading
 import time
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 
 # 环境变量必须在导入 app.config 之前设置
@@ -4574,6 +4575,768 @@ class VersionOriginalDestructionIntegrationTests(unittest.TestCase):
         self.assertIsNone(state["original_text"])
         if state["requests"]:
             self.assertTrue(all(row[1] is None for row in state["requests"]))
+
+
+@unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
+class SnapshotWithdrawalPlanIntegrationTests(unittest.TestCase):
+    """快照定时永久撤回：安排/查询/取消、到点生效、与手动撤回的先后规则、
+    重启与多实例不漏执行、公开读取 403 不扣额度不写审计。"""
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    def setUp(self):
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": TEXT_V1, "intervals": INTERVALS_V1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.record_id = r.json()["record_id"]
+
+    # ---- 工具 ----
+
+    def _publish(self, max_reads=None):
+        body = {"version": 1}
+        if max_reads is not None:
+            body["max_reads"] = max_reads
+        r = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json=body,
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def _schedule(self, snapshot_id, when, reason="按计划撤回", expected=201):
+        if isinstance(when, timedelta):
+            when = datetime.now(timezone.utc) + when
+        if isinstance(when, datetime):
+            when = when.isoformat()
+        r = self.client.post(
+            "/snapshot-withdrawal-plans",
+            headers=SERVICE_HEADERS,
+            json={"snapshot_id": snapshot_id, "scheduled_at": when, "reason": reason},
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _get_plan(self, plan_id, expected=200):
+        r = self.client.get(f"/snapshot-withdrawal-plans/{plan_id}", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _cancel(self, plan_id, expected=200):
+        r = self.client.post(
+            f"/snapshot-withdrawal-plans/{plan_id}/cancel", headers=SERVICE_HEADERS
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _settle(self, at=None):
+        """直接驱动一次到期结算（确定性，不依赖轮询线程时序）。"""
+        from app.db import SessionLocal
+
+        with SessionLocal() as session:
+            return app_main.settle_due_withdrawals_once(session, at)
+
+    def _wait_for_plan_status(self, plan_id, status, timeout=8.0):
+        """等后台轮询线程把计划推进到指定状态（每 0.05s 轮询维护侧查询接口）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            body = self._get_plan(plan_id).json()
+            if body["status"] == status:
+                return body
+            time.sleep(0.05)
+        self.fail(f"plan {plan_id} did not reach {status}; last={body}")
+
+    @staticmethod
+    def _same_instant(left: str, right: datetime) -> bool:
+        """比较两个 ISO 8601 时刻是否为同一绝对时间（兼容 Z 与 +00:00 两种写法）。"""
+        return datetime.fromisoformat(left) == right.astimezone(timezone.utc)
+
+    # ---- 创建与鉴权/校验 ----
+
+    def test_schedule_requires_service_key(self):
+        import uuid
+
+        pub = self._publish()
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        r = self.client.post(
+            "/snapshot-withdrawal-plans",
+            json={"snapshot_id": pub["snapshot_id"], "scheduled_at": future, "reason": "x"},
+        )
+        self.assertEqual(r.status_code, 401)
+        r = self.client.post(
+            "/snapshot-withdrawal-plans",
+            headers={"X-Service-Key": "wrong"},
+            json={"snapshot_id": pub["snapshot_id"], "scheduled_at": future, "reason": "x"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_schedule_unknown_snapshot_404(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        r = self._schedule(str(uuid.uuid4()), future, expected=404)
+        self.assertEqual(r.json()["detail"], "snapshot not found")
+
+    def test_schedule_past_or_naive_time_or_blank_reason_422(self):
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        # 过去时刻
+        r = self._schedule(sid, "2000-01-01T00:00:00Z", expected=422)
+        self.assertIn("scheduled_at", r.json()["detail"])
+        # 恰好“现在”（不晚于当前时刻）也拒绝
+        r = self._schedule(sid, datetime.now(timezone.utc).isoformat(), expected=422)
+        # 无时区时刻
+        r = self.client.post(
+            "/snapshot-withdrawal-plans",
+            headers=SERVICE_HEADERS,
+            json={
+                "snapshot_id": sid,
+                "scheduled_at": "2099-01-01T00:00:00",
+                "reason": "x",
+            },
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        # 空白原因
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        for bad_reason in ("", "   ", "\t\n"):
+            r = self.client.post(
+                "/snapshot-withdrawal-plans",
+                headers=SERVICE_HEADERS,
+                json={"snapshot_id": sid, "scheduled_at": future, "reason": bad_reason},
+            )
+            self.assertEqual(r.status_code, 422, (bad_reason, r.text))
+        # 全部拒绝均未产生计划：快照仍可正常公开读取
+        r = self.client.get(f"/public/snapshots/{sid}?token={pub['token']}")
+        self.assertEqual(r.status_code, 200)
+
+    def test_schedule_created_returns_plan_metadata(self):
+        pub = self._publish()
+        when = datetime.now(timezone.utc) + timedelta(hours=2)
+        body = self._schedule(pub["snapshot_id"], when, reason="合规要求下线").json()
+        self.assertFalse(body["replayed"])
+        self.assertEqual(body["status"], "pending")
+        self.assertEqual(body["snapshot_id"], pub["snapshot_id"])
+        self.assertEqual(body["reason"], "合规要求下线")
+        self.assertIsNone(body["ended_at"])
+        self.assertIsNone(body["withdrawn_at"])
+        # 预定时刻服务端统一回显为 UTC
+        scheduled = datetime.fromisoformat(body["scheduled_at"])
+        self.assertEqual(scheduled.utcoffset().total_seconds(), 0)
+        self.assertAlmostEqual(
+            scheduled, when.astimezone(timezone.utc), delta=timedelta(seconds=1)
+        )
+        self.assertIn("plan_id", body)
+        # GET 一致
+        got = self._get_plan(body["plan_id"]).json()
+        self.assertEqual(got["plan_id"], body["plan_id"])
+        self.assertEqual(got["status"], "pending")
+
+    def test_timezone_offsets_normalized_and_equivalent_is_replay(self):
+        pub = self._publish()
+        # +08:00 时刻与其对应的 UTC 时刻等价（归一化后时间点相同）
+        when_utc = datetime(2099, 1, 1, 2, 0, tzinfo=timezone.utc)
+        body1 = self._schedule(
+            pub["snapshot_id"], when_utc.astimezone(timezone(timedelta(hours=8))), reason="r"
+        ).json()
+        self.assertEqual(
+            datetime.fromisoformat(body1["scheduled_at"]), when_utc
+        )
+        # 同一时间点（UTC 表示）+ 同一原因 -> 原计划回放（200 + replayed=true）
+        r = self.client.post(
+            "/snapshot-withdrawal-plans",
+            headers=SERVICE_HEADERS,
+            json={
+                "snapshot_id": pub["snapshot_id"],
+                "scheduled_at": when_utc.isoformat(),
+                "reason": "r",
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body2 = r.json()
+        self.assertTrue(body2["replayed"])
+        self.assertEqual(body2["plan_id"], body1["plan_id"])
+
+    def test_duplicate_same_content_returns_original_plan(self):
+        pub = self._publish()
+        when = datetime.now(timezone.utc) + timedelta(hours=3)
+        first = self._schedule(pub["snapshot_id"], when, reason="同一原因").json()
+        for _ in range(2):
+            r = self._schedule(pub["snapshot_id"], when, reason="同一原因", expected=200)
+            again = r.json()
+            self.assertTrue(again["replayed"])
+            self.assertEqual(again["plan_id"], first["plan_id"])
+        # 库内只有一个计划
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        with SessionLocal() as session:
+            count = session.execute(
+                sql_text(
+                    "SELECT count(*) FROM snapshot_withdrawal_plans "
+                    "WHERE snapshot_id = :sid"
+                ),
+                {"sid": pub["snapshot_id"]},
+            ).scalar_one()
+        self.assertEqual(count, 1)
+
+    def test_change_time_or_reason_requires_cancel_first_409(self):
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        first = self._schedule(sid, timedelta(hours=1), reason="原因A").json()
+        # 改时间 -> 409，响应指明既有计划
+        r = self._schedule(sid, timedelta(hours=2), reason="原因A", expected=409)
+        self.assertEqual(r.json()["detail"]["plan_id"], first["plan_id"])
+        # 改原因 -> 409
+        self._schedule(sid, timedelta(hours=1), reason="原因B", expected=409)
+        # 取消后可用新内容重新安排
+        self._cancel(first["plan_id"])
+        second = self._schedule(sid, timedelta(hours=2), reason="原因B")
+        self.assertEqual(second.status_code, 201)
+        self.assertNotEqual(second.json()["plan_id"], first["plan_id"])
+
+    def test_schedule_against_withdrawn_snapshot_409(self):
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        self.client.post(
+            f"/snapshots/{sid}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "先手动撤回"},
+        )
+        r = self._schedule(sid, timedelta(hours=1), expected=409)
+        self.assertIn("already been withdrawn", r.json()["detail"])
+
+    def test_get_unknown_plan_404(self):
+        r = self.client.get(f"/snapshot-withdrawal-plans/{uuid.uuid4()}", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 404)
+        r = self.client.get(f"/snapshot-withdrawal-plans/{uuid.uuid4()}")
+        self.assertEqual(r.status_code, 401)
+
+    # ---- 取消 ----
+
+    def test_cancel_before_due_then_snapshot_stays_public_and_reschedulable(self):
+        pub = self._publish(max_reads=3)
+        sid, tok = pub["snapshot_id"], pub["token"]
+        plan = self._schedule(sid, timedelta(hours=1)).json()
+        body = self._cancel(plan["plan_id"]).json()
+        self.assertEqual(body["status"], "cancelled")
+        self.assertIsNotNone(body["ended_at"])
+        self.assertIsNone(body["withdrawn_at"])
+        # 取消后快照仍公开可读
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token={tok}").status_code, 200
+        )
+        # 可重新安排
+        second = self._schedule(sid, timedelta(hours=2))
+        self.assertEqual(second.status_code, 201)
+
+    def test_cancel_completed_or_cancelled_or_superseded_plan_409(self):
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        # 已取消
+        p_cancelled = self._schedule(sid, timedelta(hours=4), reason="c").json()
+        self._cancel(p_cancelled["plan_id"])
+        r = self._cancel(p_cancelled["plan_id"], expected=409)
+        self.assertEqual(r.json()["detail"]["status"], "cancelled")
+        # 已生效（completed）
+        p_due = self._schedule(sid, timedelta(seconds=2), reason="due").json()
+        self._wait_for_plan_status(p_due["plan_id"], "completed")
+        r = self._cancel(p_due["plan_id"], expected=409)
+        self.assertEqual(r.json()["detail"]["status"], "completed")
+        # superseded：手动撤回先发生（另一条记录，其版本 1 快照仍独立）
+        other = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": "又一条记录，内容C。", "intervals": [{"start": 0, "end": 3}]},
+        ).json()["record_id"]
+        other_pub = self.client.post(
+            f"/records/{other}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        ).json()
+        sid2 = other_pub["snapshot_id"]
+        p_sup = self._schedule(sid2, timedelta(hours=5), reason="future").json()
+        self.client.post(
+            f"/snapshots/{sid2}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "手动优先"},
+        )
+        body = self._get_plan(p_sup["plan_id"]).json()
+        self.assertEqual(body["status"], "superseded")
+        r = self._cancel(p_sup["plan_id"], expected=409)
+        self.assertEqual(r.json()["detail"]["status"], "superseded")
+
+    def test_cancel_unknown_plan_404(self):
+        r = self.client.post(
+            f"/snapshot-withdrawal-plans/{uuid.uuid4()}/cancel", headers=SERVICE_HEADERS
+        )
+        self.assertEqual(r.status_code, 404)
+
+    def test_cancel_at_exact_due_time_loses_to_settlement(self):
+        """取消请求在计划恰已到点时到达：到期结算优先，取消被 409 拒绝。"""
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        target = datetime.now(timezone.utc) + timedelta(seconds=10)
+        plan = self._schedule(sid, target, reason="边界").json()
+        # 直接以“计划已到点”的服务端时刻驱动取消事务内的惰性结算
+        at = target + timedelta(seconds=1)
+        from sqlalchemy import select
+        from sqlalchemy import text as sql_text  # noqa: F401
+
+        from app.db import SessionLocal
+        from app.models import Snapshot as SnapshotModel
+
+        with SessionLocal() as session:
+            snapshot = session.execute(
+                select(SnapshotModel)
+                .where(SnapshotModel.id == sid)
+                .with_for_update()
+            ).scalar_one()
+            app_main._settle_snapshot_withdrawal_plans(session, snapshot, at)
+            session.commit()
+        r = self._cancel(plan["plan_id"], expected=409)
+        self.assertEqual(r.json()["detail"]["status"], "completed")
+
+    def test_cancel_settles_due_plan_inside_request_and_loses(self):
+        """取消请求自身在快照行锁内发现计划已到点：结算生效，取消 409。
+
+        停掉后台线程并把预定时刻改到过去，确定性地让“到期”只可能发生在取消
+        请求事务内（同时回拨 created_at 以满足 scheduled_at > created_at CHECK）。
+        """
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        plan = self._schedule(sid, timedelta(seconds=20), reason="请求内结算").json()
+        app_main._withdrawal_scheduler.stop()
+        try:
+            from sqlalchemy import text as sql_text
+
+            from app.db import SessionLocal
+
+            with SessionLocal() as session:
+                session.execute(
+                    sql_text(
+                        "UPDATE snapshot_withdrawal_plans SET scheduled_at = "
+                        "now() - interval '2 second', created_at = now() - interval '3 second' "
+                        "WHERE id = :pid"
+                    ),
+                    {"pid": plan["plan_id"]},
+                )
+                session.commit()
+            r = self._cancel(plan["plan_id"], expected=409)
+            self.assertEqual(r.json()["detail"]["status"], "completed")
+            # 结算随拒绝响应一同提交：计划 completed、快照撤回（时间=预定时刻、原因=计划原因）
+            got = self._get_plan(plan["plan_id"]).json()
+            self.assertEqual(got["status"], "completed")
+            info = self.client.get(
+                f"/records/{self.record_id}", headers=SERVICE_HEADERS
+            ).json()["snapshots"][0]
+            self.assertEqual(info["status"], "withdrawn")
+            self.assertEqual(info["withdraw_reason"], "请求内结算")
+        finally:
+            app_main._withdrawal_scheduler.start()
+
+    # ---- 到点生效 ----
+
+    def test_due_plan_withdraws_snapshot_at_scheduled_time_with_plan_reason(self):
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        target = datetime.now(timezone.utc) + timedelta(hours=1)
+        plan = self._schedule(sid, target, reason="定时下线原因").json()
+        # 未到点：结算无效果（本计划保持 pending）
+        self._settle(datetime.now(timezone.utc))
+        self.assertEqual(self._get_plan(plan["plan_id"]).json()["status"], "pending")
+        snapshot_still = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()["snapshots"][0]
+        self.assertEqual(snapshot_still["status"], "published")
+        # 到点：确定性结算（共享测试库可能同时终结其他用例计划，按 >=1 断言）
+        self.assertGreaterEqual(self._settle(target + timedelta(milliseconds=1)), 1)
+        body = self._get_plan(plan["plan_id"]).json()
+        self.assertEqual(body["status"], "completed")
+        self.assertTrue(self._same_instant(body["withdrawn_at"], target))
+        self.assertTrue(self._same_instant(body["ended_at"], target))
+        # 快照撤回时间取预定时刻、原因取计划原因
+        info = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()["snapshots"][0]
+        self.assertEqual(info["status"], "withdrawn")
+        self.assertTrue(self._same_instant(info["withdrawn_at"], target))
+        self.assertEqual(info["withdraw_reason"], "定时下线原因")
+
+    def test_due_settlement_is_idempotent_across_runs_and_instances(self):
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        target = datetime.now(timezone.utc) + timedelta(minutes=30)
+        plan = self._schedule(sid, target, reason="r").json()
+        at = target + timedelta(seconds=5)
+        self.assertGreaterEqual(self._settle(at), 1)
+        self.assertEqual(self._get_plan(plan["plan_id"]).json()["status"], "completed")
+        # 再次结算（模拟重启/多实例）：本计划状态不再变化、撤回时间不被改写
+        self._settle(at)
+        self.assertEqual(self._get_plan(plan["plan_id"]).json()["status"], "completed")
+        from app.db import SessionLocal
+        from app.models import Snapshot as SnapshotModel
+
+        with SessionLocal() as session:
+            row = session.get(SnapshotModel, sid)
+            self.assertEqual(row.withdrawn_at, target)
+            self.assertEqual(row.withdraw_reason, "r")
+
+    def test_background_worker_withdraws_due_plan_without_any_request(self):
+        """无人访问的快照：后台轮询线程到点也自动撤回（重启/多实例兜底）。"""
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        target = datetime.now(timezone.utc) + timedelta(milliseconds=400)
+        plan = self._schedule(sid, target, reason="自动到点").json()
+        # 不调用任何结算函数，只等后台线程
+        body = self._wait_for_plan_status(plan["plan_id"], "completed", timeout=8)
+        self.assertTrue(self._same_instant(body["withdrawn_at"], target))
+        # 公开读取立即按撤回处理
+        r = self.client.get(f"/public/snapshots/{sid}?token={pub['token']}")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["detail"], "snapshot unavailable")
+
+    def test_due_read_gets_vague_403_without_quota_or_audit_others_unaffected(self):
+        # 快照 A：令牌上限 3，撤回前成功读 1 次；快照 B：同记录版本 2 不受影响
+        pub_a = self._publish(max_reads=3)
+        sid_a, tok_a = pub_a["snapshot_id"], pub_a["token"]
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid_a}?token={tok_a}").status_code, 200
+        )
+        r = self.client.put(
+            f"/records/{self.record_id}",
+            headers=SERVICE_HEADERS,
+            json={"base_version": 1, "text": TEXT_V2,
+                  "intervals": [{"start": 9, "end": 15}]},
+        )
+        self.assertEqual(r.status_code, 200)
+        pub_b = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 2, "max_reads": 3},
+        ).json()
+        sid_b, tok_b = pub_b["snapshot_id"], pub_b["token"]
+
+        target = datetime.now(timezone.utc) + timedelta(milliseconds=400)
+        plan = self._schedule(sid_a, target, reason="到点拒绝").json()
+        # 不调用任何结算函数，只等后台线程自动撤回
+        self._wait_for_plan_status(plan["plan_id"], "completed", timeout=8)
+        # 到点后的公开读取：模糊 403，不扣单令牌额度、不写成功审计
+        for _ in range(2):
+            r = self.client.get(f"/public/snapshots/{sid_a}?token={tok_a}")
+            self.assertEqual(r.status_code, 403)
+            self.assertEqual(r.json()["detail"], "snapshot unavailable")
+            self.assertNotIn("到点拒绝", r.text)
+        q = self.client.get(f"/tokens/{tok_a}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 1)
+        self.assertEqual(q["remaining_reads"], 2)
+        events = self.client.get(
+            f"/snapshots/{sid_a}/read-events"
+            "?start=2000-01-01T00:00:00Z&end=2100-01-01T00:00:00Z",
+            headers=SERVICE_HEADERS,
+        ).json()["events"]
+        self.assertEqual(len(events), 1)
+        # 清单/记录内其他快照不受影响
+        r = self.client.get(f"/public/snapshots/{sid_b}?token={tok_b}")
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_due_bundle_read_403_without_consuming_shared_quota(self):
+        # 共享凭证清单 A+B：A 到点撤回后读 A 403 不扣共享额度，B 仍可读
+        other = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": "另一条记录，内容B。", "intervals": [{"start": 0, "end": 3}]},
+        ).json()["record_id"]
+        other_pub = self.client.post(
+            f"/records/{other}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        ).json()
+        sid_a = self._publish()["snapshot_id"]
+        sid_b = other_pub["snapshot_id"]
+        submit = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={"snapshot_ids": [sid_a, sid_b], "max_reads": 5},
+        )
+        self.assertEqual(submit.status_code, 201, submit.text)
+        approve = self.client.post(
+            f"/bundle-requests/{submit.json()['request_id']}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(approve.status_code, 200, approve.text)
+        cred = approve.json()["credential"]
+        target = datetime.now(timezone.utc) + timedelta(milliseconds=400)
+        plan = self._schedule(sid_a, target, reason="共享清单单项到点").json()
+        self._wait_for_plan_status(plan["plan_id"], "completed")
+        # 读已撤回项：403 不扣额度
+        for _ in range(2):
+            r = self.client.get(f"/public/snapshots/{sid_a}?token={cred}")
+            self.assertEqual(r.status_code, 403)
+        status_body = self.client.get(
+            f"/read-bundles/{approve.json()['bundle_id']}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["reads_used"], 0)
+        # 其他项继续可读
+        r = self.client.get(f"/public/snapshots/{sid_b}?token={cred}")
+        self.assertEqual(r.status_code, 200)
+
+    def test_due_read_lazy_settlement_commits_before_rejecting(self):
+        """计划已到点但尚未被任何结算处理：公开读取在快照行锁内惰性完成结算后 403。"""
+        pub = self._publish(max_reads=2)
+        sid, tok = pub["snapshot_id"], pub["token"]
+        target = datetime.now(timezone.utc) + timedelta(seconds=20)
+        plan = self._schedule(sid, target, reason="惰性结算").json()
+        # 停掉后台线程，把预定时刻改到过去，确定性制造“已到点但未结算”的窗口
+        app_main._withdrawal_scheduler.stop()
+        try:
+            from sqlalchemy import text as sql_text
+
+            from app.db import SessionLocal
+
+            with SessionLocal() as session:
+                session.execute(
+                    sql_text(
+                        "UPDATE snapshot_withdrawal_plans SET scheduled_at = "
+                        "now() - interval '1 second', created_at = now() - interval '2 seconds' "
+                        "WHERE id = :pid"
+                    ),
+                    {"pid": plan["plan_id"]},
+                )
+                session.commit()
+            # 公开读取自身在快照行锁内完成到期结算，随后按已撤回快照模糊 403
+            r = self.client.get(f"/public/snapshots/{sid}?token={tok}")
+            self.assertEqual(r.status_code, 403)
+            q = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS).json()
+            self.assertEqual(q["reads_used"], 0)
+            self.assertEqual(
+                self._get_plan(plan["plan_id"]).json()["status"], "completed"
+            )
+        finally:
+            app_main._withdrawal_scheduler.start()
+
+    def test_publish_after_due_conflicts_via_lazy_settlement(self):
+        """到点计划未被后台线程结算时，直接发布在快照行锁内惰性结算并 409。"""
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        target = datetime.now(timezone.utc) + timedelta(seconds=30)
+        self._schedule(sid, target, reason="发布冲突")
+        # 停掉后台线程并把库里的预定时刻改到过去（计划仍 pending），
+        # 确定性制造“到点未结算”的窗口
+        app_main._withdrawal_scheduler.stop()
+        try:
+            from sqlalchemy import text as sql_text
+
+            from app.db import SessionLocal
+
+            with SessionLocal() as session:
+                session.execute(
+                    sql_text(
+                        "UPDATE snapshot_withdrawal_plans SET scheduled_at = "
+                        "now() - interval '1 second', created_at = now() - interval '2 seconds' "
+                        "WHERE snapshot_id = :sid AND status = 'pending'"
+                    ),
+                    {"sid": sid},
+                )
+                session.commit()
+            r = self.client.post(
+                f"/records/{self.record_id}/publish",
+                headers=SERVICE_HEADERS,
+                json={"version": 1},
+            )
+            self.assertEqual(r.status_code, 409, r.text)
+        finally:
+            app_main._withdrawal_scheduler.start()
+        info = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()["snapshots"][0]
+        self.assertEqual(info["status"], "withdrawn")
+
+    # ---- 手动撤回与计划的先后规则 ----
+
+    def test_manual_withdrawal_first_terminates_plan_and_wins_time_reason(self):
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        target = datetime.now(timezone.utc) + timedelta(hours=2)
+        plan = self._schedule(sid, target, reason="计划原因").json()
+        before = datetime.now(timezone.utc)
+        r = self.client.post(
+            f"/snapshots/{sid}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "手动原因"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        manual_at = datetime.fromisoformat(r.json()["withdrawn_at"])
+        self.assertGreaterEqual(manual_at, before - timedelta(seconds=1))
+        self.assertLess(manual_at, target)
+        # 计划终止为 superseded
+        body = self._get_plan(plan["plan_id"]).json()
+        self.assertEqual(body["status"], "superseded")
+        self.assertIsNone(body["withdrawn_at"])
+        self.assertIsNotNone(body["ended_at"])
+        # 撤回时间与原因以手动为准
+        info = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()["snapshots"][0]
+        self.assertEqual(info["withdraw_reason"], "手动原因")
+        self.assertEqual(info["withdrawn_at"], r.json()["withdrawn_at"])
+        # 计划终止后不能取消
+        self._cancel(plan["plan_id"], expected=409)
+
+    def test_manual_withdrawal_after_due_replays_first_result_cannot_rewrite_reason(self):
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        target = datetime.now(timezone.utc) + timedelta(hours=1)
+        self._schedule(sid, target, reason="计划原因X")
+        # 计划先到点结算
+        self._settle(target + timedelta(seconds=1))
+        # 之后手动撤回（不同原因/空原因）只回放首次结果
+        for body in ({"reason": "试图改写的手动原因"}, {}):
+            r = self.client.post(
+                f"/snapshots/{sid}/withdraw", headers=SERVICE_HEADERS, json=body
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertTrue(self._same_instant(r.json()["withdrawn_at"], target))
+        info = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()["snapshots"][0]
+        self.assertTrue(self._same_instant(info["withdrawn_at"], target))
+        self.assertEqual(info["withdraw_reason"], "计划原因X")
+
+    def test_manual_blank_reason_with_future_pending_plan_is_422(self):
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        self._schedule(sid, timedelta(hours=1), reason="计划仍在未来")
+        # 快照仍公开、手动撤回缺原因 -> 422，计划不受影响
+        r = self.client.post(
+            f"/snapshots/{sid}/withdraw", headers=SERVICE_HEADERS, json={}
+        )
+        self.assertEqual(r.status_code, 422)
+        info = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()["snapshots"][0]
+        self.assertEqual(info["status"], "published")
+
+    # ---- 并发与多实例 ----
+
+    def test_concurrent_schedule_creates_only_one_active_plan(self):
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        when = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        plan_ids: list = []
+        statuses: list[int] = []
+        barrier = threading.Barrier(6)
+
+        def submit(i):
+            barrier.wait()
+            client = TestClient(app_main.app)
+            r = client.post(
+                "/snapshot-withdrawal-plans",
+                headers=SERVICE_HEADERS,
+                json={"snapshot_id": sid, "scheduled_at": when, "reason": f"r{i}"},
+            )
+            statuses.append(r.status_code)
+            if r.status_code in (200, 201):
+                plan_ids.append(r.json()["plan_id"])
+
+        threads = [threading.Thread(target=submit, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # 恰好一个 201，其余均为 409（原因各不相同）；绝无两个有效计划
+        self.assertEqual(statuses.count(201), 1, statuses)
+        self.assertTrue(all(s in (201, 409) for s in statuses), statuses)
+        self.assertEqual(len(set(plan_ids)), 1)
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        with SessionLocal() as session:
+            active = session.execute(
+                sql_text(
+                    "SELECT count(*) FROM snapshot_withdrawal_plans "
+                    "WHERE snapshot_id = :sid AND status = 'pending'"
+                ),
+                {"sid": sid},
+            ).scalar_one()
+        self.assertEqual(active, 1)
+
+    def test_concurrent_manual_and_due_settlement_one_outcome(self):
+        """计划到点与手动撤回并发：恰好一个首次撤回，原因与时间自洽，计划终态唯一。"""
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        results: list = []
+        target = datetime.now(timezone.utc) + timedelta(milliseconds=500)
+        plan = self._schedule(sid, target, reason="计划原因Z").json()
+        barrier = threading.Barrier(2)
+
+        def manual():
+            # 等计划到点后与结算并发提交
+            time.sleep(0.7)
+            barrier.wait()
+            client = TestClient(app_main.app)
+            r = client.post(
+                f"/snapshots/{sid}/withdraw",
+                headers=SERVICE_HEADERS,
+                json={"reason": "手动原因Z"},
+            )
+            results.append(("manual", r.status_code, r.json().get("withdrawn_at")))
+
+        def settle():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            # 一次公开读取可能触发惰性结算
+            r = client.get(f"/public/snapshots/{sid}?token={pub['token']}")
+            results.append(("read", r.status_code, None))
+
+        t1 = threading.Thread(target=manual)
+        t2 = threading.Thread(target=settle)
+        t1.start(); t2.start(); t1.join(); t2.join()
+        # 最终：快照撤回，原因唯一且不矛盾；计划为 completed 或 superseded 之一
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            body = self._get_plan(plan["plan_id"]).json()
+            if body["status"] in ("completed", "superseded"):
+                break
+            time.sleep(0.05)
+        self.assertIn(body["status"], ("completed", "superseded"))
+        info = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()["snapshots"][0]
+        self.assertEqual(info["status"], "withdrawn")
+        if body["status"] == "completed":
+            self.assertEqual(info["withdraw_reason"], "计划原因Z")
+            self.assertTrue(self._same_instant(info["withdrawn_at"], target))
+        else:
+            self.assertEqual(info["withdraw_reason"], "手动原因Z")
+        # 此后读取稳定 403
+        for _ in range(3):
+            self.assertEqual(
+                self.client.get(f"/public/snapshots/{sid}?token={pub['token']}").status_code,
+                403,
+            )
+
+    def test_plans_survive_restart_and_still_execute(self):
+        """服务重启（重新跑启动升级）后，未来计划不丢且到点照常执行。"""
+        pub = self._publish()
+        sid = pub["snapshot_id"]
+        target = datetime.now(timezone.utc) + timedelta(hours=3)
+        plan = self._schedule(sid, target, reason="重启后仍生效").json()
+        # 模拟重启：重新执行启动升级流程（幂等核对）并重启调度器
+        app_main._init_db_with_retry()
+        app_main._withdrawal_scheduler.stop()
+        app_main._withdrawal_scheduler.start()
+        body = self._get_plan(plan["plan_id"]).json()
+        self.assertEqual(body["status"], "pending")
+        self.assertTrue(self._same_instant(body["scheduled_at"], target))
+        # 到点结算仍生效（共享测试库中其他用例的到期计划也可能在本轮被终结）
+        self.assertGreaterEqual(self._settle(target + timedelta(seconds=1)), 1)
+        self.assertEqual(self._get_plan(plan["plan_id"]).json()["status"], "completed")
 
 
 if __name__ == "__main__":

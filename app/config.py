@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     # 启动时等待数据库就绪的重试参数
     db_connect_retries: int = 30
     db_connect_retry_delay_seconds: float = 1.0
+    # 快照定时撤回后台结算线程的轮询间隔（秒）：只影响“到点”与快照真正落库之间
+    # 的最大延迟；公开读取与各维护路径在快照行锁内还会惰性结算，故即使间隔较长、
+    # 服务重启或多实例运行，到期计划也不会漏执行或被重复执行
+    withdrawal_schedule_poll_seconds: float = 1.0
 
     @field_validator("review_credentials")
     @classmethod

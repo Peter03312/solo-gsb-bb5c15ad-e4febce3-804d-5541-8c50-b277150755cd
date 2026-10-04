@@ -334,6 +334,61 @@ def _migrate_7_version_original_destruction(conn) -> None:
     )
 
 
+def _migrate_8_snapshot_withdrawal_plans(conn) -> None:
+    """v8：快照定时永久撤回计划表。
+
+    空库路径下 v1 的 create_all 已按当前模型建出该表（含 CHECK 与索引），此处幂等；
+    旧库路径先按当前模型补齐表，再以 IF NOT EXISTS 收敛索引，以 DO 块幂等收敛
+    CHECK 约束（重复添加捕获 duplicate_object 跳过）。只新增结构，不改动任何既有
+    数据：升级后所有已发布快照默认没有定时撤回计划，撤回、冻结、凭证、审计与
+    公开读取语义完全不变。
+    """
+    Base.metadata.create_all(bind=conn, checkfirst=True)
+    conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_snapshot_withdrawal_plans_active
+            ON snapshot_withdrawal_plans (snapshot_id) WHERE status = 'pending'
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_snapshot_withdrawal_plans_due
+            ON snapshot_withdrawal_plans (scheduled_at) WHERE status = 'pending'
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_snapshot_withdrawal_plans_snapshot
+            ON snapshot_withdrawal_plans (snapshot_id, created_at)
+            """
+        )
+    )
+    check_constraints = (
+        ("ck_snapshot_withdrawal_plans_status",
+         "status IN ('pending', 'completed', 'cancelled', 'superseded')"),
+        ("ck_snapshot_withdrawal_plans_future", "scheduled_at > created_at"),
+    )
+    for constraint_name, expression in check_constraints:
+        conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                    ALTER TABLE snapshot_withdrawal_plans
+                    ADD CONSTRAINT {constraint_name} CHECK ({expression});
+                EXCEPTION
+                    WHEN duplicate_object THEN NULL;
+                END $$;
+                """
+            )
+        )
+
+
 # (版本号, 版本名称, 升级函数)。追加新版本时只允许在末尾追加，永不改写历史版本。
 MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (1, "initial_schema", _migrate_1_initial_schema),
@@ -343,6 +398,7 @@ MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (5, "sensitive_phrases", _migrate_5_sensitive_phrases),
     (6, "snapshot_windows", _migrate_6_snapshot_windows),
     (7, "version_original_destruction", _migrate_7_version_original_destruction),
+    (8, "snapshot_withdrawal_plans", _migrate_8_snapshot_withdrawal_plans),
 )
 
 TARGET_SCHEMA_VERSION = MIGRATIONS[-1][0]

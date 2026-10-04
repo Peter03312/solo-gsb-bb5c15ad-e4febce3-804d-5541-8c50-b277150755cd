@@ -186,6 +186,93 @@ class Snapshot(Base):
     )
 
 
+# 快照定时永久撤回计划的终态/终止态
+WITHDRAWAL_PLAN_PENDING = "pending"
+WITHDRAWAL_PLAN_COMPLETED = "completed"
+WITHDRAWAL_PLAN_CANCELLED = "cancelled"
+# 计划生效前快照被手动撤回：计划终止，撤回时间与原因以手动撤回为准
+WITHDRAWAL_PLAN_SUPERSEDED = "superseded"
+WITHDRAWAL_PLAN_STATUSES = (
+    WITHDRAWAL_PLAN_PENDING,
+    WITHDRAWAL_PLAN_COMPLETED,
+    WITHDRAWAL_PLAN_CANCELLED,
+    WITHDRAWAL_PLAN_SUPERSEDED,
+)
+
+
+class SnapshotWithdrawalPlan(Base):
+    """已发布快照的未来永久撤回计划（机构维护侧）。
+
+    维护人员凭服务密钥为某个已发布快照登记一个晚于服务端当前时刻的带时区
+    撤回时刻与非空原因：
+    - pending：有效计划，到 scheduled_at 即视为撤回；每个快照至多有一个
+      pending 计划（部分唯一索引 uq_snapshot_withdrawal_plans_active 保证，
+      创建事务在快照行锁上串行化并发提交）；
+    - completed：计划到点生效，快照在同一事务被永久撤回，
+      snapshots.withdrawn_at 取计划的 scheduled_at、withdraw_reason 取计划原因；
+    - cancelled：生效前被显式取消，快照继续公开；
+    - superseded：生效前快照先被手动撤回，计划终止——撤回时间与原因一律以
+      手动撤回为准。之后对手动撤回的重复调用只回放首次结果，不能改写原因。
+
+    到期结算不依赖单点计时器：后台调度线程按轮询间隔批量结算，公开读取与
+    全部会锁快照行的维护路径在持锁期间先做一次到期结算（惰性生效）。多实例
+    部署时各实例都可结算，快照行锁 + 仅命中 pending 行的条件 UPDATE 保证
+    恰好生效一次；服务重启后计划仍在库中，必被任一实例结算，绝不漏执行。
+    """
+
+    __tablename__ = "snapshot_withdrawal_plans"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'completed', 'cancelled', 'superseded')",
+            name="ck_snapshot_withdrawal_plans_status",
+        ),
+        # 预定时刻必须晚于计划创建时刻（应用层另校验其晚于提交时的服务端当前时刻）
+        CheckConstraint(
+            "scheduled_at > created_at",
+            name="ck_snapshot_withdrawal_plans_future",
+        ),
+        # 每个快照至多一个有效（pending）计划
+        Index(
+            "uq_snapshot_withdrawal_plans_active",
+            "snapshot_id",
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
+        # 后台调度线程的到期扫描索引（仅 pending 行）
+        Index(
+            "ix_snapshot_withdrawal_plans_due",
+            "scheduled_at",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index("ix_snapshot_withdrawal_plans_snapshot", "snapshot_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False
+    )
+    # 预定撤回时刻（带时区，统一存 UTC）：到点即以此作为快照撤回时间
+    scheduled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # 计划撤回原因：非空白，仅维护侧可见；生效后写入 snapshots.withdraw_reason
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default=WITHDRAWAL_PLAN_PENDING,
+        default=WITHDRAWAL_PLAN_PENDING,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # 终结时刻：completed 取 scheduled_at；cancelled/superseded 取操作提交时刻；
+    # pending 时恒为 NULL
+    ended_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class ReadToken(Base):
     """快照的随机读取令牌，可设到期时间、可撤销，并可设成功读取次数上限。
 

@@ -132,8 +132,8 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
     def test_fresh_database_applies_every_version_in_order(self):
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
         self.assertEqual(previous, 0)
-        self.assertEqual(applied, [1, 2, 3, 4, 5, 6, 7])
-        self.assertEqual(self._versions(), {1, 2, 3, 4, 5, 6, 7})
+        self.assertEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual(self._versions(), {1, 2, 3, 4, 5, 6, 7, 8})
         tables = set(inspect(self.engine).get_table_names())
         self.assertIn("schema_migrations", tables)
         for expected in (
@@ -150,11 +150,33 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
             "record_freezes",
             "sensitive_phrase_settings",
             "version_original_destructions",
+            "snapshot_withdrawal_plans",
         ):
             self.assertIn(expected, tables)
         # “每条记录至多一个当前冻结期”的部分唯一索引随 v1 建表即存在
         indexes = {ix["name"] for ix in inspect(self.engine).get_indexes("record_freezes")}
         self.assertIn("uq_record_freezes_active", indexes)
+        # v8：定时撤回计划表的“每快照至多一个 pending 计划”部分唯一索引与到期扫描索引
+        plan_indexes = {
+            ix["name"]
+            for ix in inspect(self.engine).get_indexes("snapshot_withdrawal_plans")
+        }
+        self.assertIn("uq_snapshot_withdrawal_plans_active", plan_indexes)
+        self.assertIn("ix_snapshot_withdrawal_plans_due", plan_indexes)
+        # v8：状态约束与“预定时刻晚于创建时刻”约束真实存在
+        with self.engine.connect() as conn:
+            plan_checks = {
+                row[0]
+                for row in conn.execute(
+                    text(
+                        "SELECT conname FROM pg_constraint "
+                        "WHERE conrelid = 'snapshot_withdrawal_plans'::regclass "
+                        "AND contype = 'c'"
+                    )
+                ).all()
+            }
+            self.assertIn("ck_snapshot_withdrawal_plans_status", plan_checks)
+            self.assertIn("ck_snapshot_withdrawal_plans_future", plan_checks)
         # v7：版本原文销毁表的 (record_id, version) 唯一索引
         destruction_indexes = {
             ix["name"]
@@ -254,6 +276,75 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
             ).one()
         self.assertEqual((sid, list(phrases), version), (1, [], 1))
 
+    def test_v8_withdrawal_plan_constraints_enforced(self):
+        """v8：部分唯一索引（每快照至多一个 pending）与 CHECK 约束在空库真实生效。"""
+        migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
+        from sqlalchemy.exc import DBAPIError as _DBAPIError
+
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO records (id, current_version, created_at, updated_at) "
+                    "VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 1, now(), now())"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO snapshots (id, record_id, version, redacted_text, published_at) "
+                    "VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', "
+                    "'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 1, 'x', now())"
+                )
+            )
+        with self.engine.begin() as conn:
+            # scheduled_at <= created_at 违反“未来时刻”CHECK，整事务回滚
+            with self.assertRaises(_DBAPIError):
+                conn.execute(
+                    text(
+                        "INSERT INTO snapshot_withdrawal_plans "
+                        "(id, snapshot_id, scheduled_at, reason, status, created_at) "
+                        "VALUES (gen_random_uuid(), 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', "
+                        "now(), 'r', 'pending', now() + interval '1 hour')"
+                    )
+                )
+        with self.engine.begin() as conn:
+            # 合法 pending 计划
+            conn.execute(
+                text(
+                    "INSERT INTO snapshot_withdrawal_plans "
+                    "(id, snapshot_id, scheduled_at, reason, status, created_at) "
+                    "VALUES ('cccccccc-cccc-cccc-cccc-cccccccccccc', "
+                    "'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', "
+                    "now() + interval '2 hour', 'r1', 'pending', now())"
+                )
+            )
+        with self.engine.begin() as conn:
+            # 同快照第二个 pending 计划违反部分唯一索引
+            with self.assertRaises(_DBAPIError):
+                conn.execute(
+                    text(
+                        "INSERT INTO snapshot_withdrawal_plans "
+                        "(id, snapshot_id, scheduled_at, reason, status, created_at) "
+                        "VALUES (gen_random_uuid(), 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', "
+                        "now() + interval '3 hour', 'r2', 'pending', now())"
+                    )
+                )
+        with self.engine.begin() as conn:
+            # 第一个计划终结（completed）后，同快照可再开一个新 pending 计划
+            conn.execute(
+                text(
+                    "UPDATE snapshot_withdrawal_plans SET status='completed', "
+                    "ended_at=scheduled_at WHERE id = 'cccccccc-cccc-cccc-cccc-cccccccccccc'"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO snapshot_withdrawal_plans "
+                    "(id, snapshot_id, scheduled_at, reason, status, created_at) "
+                    "VALUES (gen_random_uuid(), 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', "
+                    "now() + interval '4 hour', 'r3', 'pending', now())"
+                )
+            )
+
     def test_migrations_module_is_self_contained_for_metadata(self):
         """只导入 app.migrations（不导入 app.models）也能建出全部业务表。
 
@@ -270,9 +361,10 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
             f"eng = create_engine({self.url!r});"
             "prev, applied = migrations.run_upgrade(eng, connect_retries=1, connect_retry_delay=0);"
             "names = set(inspect(eng).get_table_names());"
-            "assert applied == [1, 2, 3, 4, 5, 6, 7], applied;"
+            "assert applied == [1, 2, 3, 4, 5, 6, 7, 8], applied;"
             "assert 'records' in names and 'read_audit_events' in names, names;"
             "assert 'sensitive_phrase_settings' in names, names;"
+            "assert 'snapshot_withdrawal_plans' in names, names;"
             "print('SELF_CONTAINED_OK')"
         )
         env = dict(os.environ)
@@ -419,9 +511,9 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
             )
 
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
-        # 旧库补登 v1 基线：v1 不重放，只增量执行 v2/v3/v4/v5/v6/v7
+        # 旧库补登 v1 基线：v1 不重放，只增量执行 v2..v8
         self.assertEqual(previous, 1)
-        self.assertEqual(applied, [2, 3, 4, 5, 6, 7])
+        self.assertEqual(applied, [2, 3, 4, 5, 6, 7, 8])
 
         with self.engine.connect() as conn:
             baseline_name = conn.execute(
@@ -548,7 +640,7 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
             )
 
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
-        self.assertEqual((previous, applied), (1, [2, 3, 4, 5, 6, 7]))
+        self.assertEqual((previous, applied), (1, [2, 3, 4, 5, 6, 7, 8]))
         with self.engine.connect() as conn:
             reads_used, chain_id, rotated = conn.execute(
                 text(
@@ -635,7 +727,7 @@ class NewerAndFailureHandlingTests(unittest.TestCase):
         migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
         # 回到“只完成 v1”的状态，让升级重新尝试 v2
         with self.engine.begin() as conn:
-            conn.execute(text("DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7)"))
+            conn.execute(text("DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8)"))
             conn.execute(
                 text(
                     "DROP TRIGGER IF EXISTS trg_read_audit_events_no_update "
@@ -686,18 +778,18 @@ class NewerAndFailureHandlingTests(unittest.TestCase):
             locker.execute(text("ROLLBACK"))
             locker.close()
 
-        # 释放阻塞后重试：v2/v3/v4/v5/v6/v7 依次成功
+        # 释放阻塞后重试：v2/v3/v4/v5/v6/v7/v8 依次成功
         previous, applied = migrations.run_upgrade(
             self.engine, connect_retries=1, connect_retry_delay=0
         )
         self.assertEqual(previous, 1)
-        self.assertEqual(applied, [2, 3, 4, 5, 6, 7])
+        self.assertEqual(applied, [2, 3, 4, 5, 6, 7, 8])
         with self.engine.connect() as conn:
             versions = {
                 row[0]
                 for row in conn.execute(text("SELECT version FROM schema_migrations"))
             }
-        self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7})
+        self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7, 8})
         # v4 收敛出冻结表与部分唯一索引
         with self.engine.connect() as conn:
             freeze_table = conn.execute(
@@ -770,9 +862,9 @@ class ConcurrentStartupTests(unittest.TestCase):
 
         self.assertEqual(len(results), num_instances)
         self.assertTrue(all(isinstance(r, tuple) for r in results), results)
-        # 恰好一个实例真正执行了 [1,2,3,4,5]，其余 applied 为空
+        # 恰好一个实例真正执行了 [1..8]，其余 applied 为空
         applied_lists = [applied for _, applied in results]
-        self.assertEqual(sorted(applied_lists, key=len, reverse=True)[0], [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(sorted(applied_lists, key=len, reverse=True)[0], [1, 2, 3, 4, 5, 6, 7, 8])
         self.assertTrue(all(applied == [] for applied in applied_lists[1:]), applied_lists)
         with self.engine.connect() as conn:
             versions = [
@@ -781,7 +873,7 @@ class ConcurrentStartupTests(unittest.TestCase):
                     text("SELECT version FROM schema_migrations ORDER BY version")
                 )
             ]
-        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8])
 
     def test_advisory_lock_key_is_stable(self):
         # 锁键固定：各实例竞争的是同一把集群级锁

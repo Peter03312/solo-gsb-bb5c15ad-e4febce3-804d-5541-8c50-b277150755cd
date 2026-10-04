@@ -80,6 +80,56 @@ class SnapshotWithdrawResponse(BaseModel):
     status: str
 
 
+# ---- 快照定时永久撤回计划（机构维护侧） ----
+
+
+class SnapshotWithdrawalPlanCreate(BaseModel):
+    """为已发布快照安排未来永久撤回：预定时刻（带时区、晚于服务端当前时刻）+ 非空原因。"""
+
+    snapshot_id: UUID
+    # 预定撤回时刻：必须显式携带时区信息（naive 时刻无法确定其所属时区，拒绝）；
+    # 是否晚于服务端当前时刻在提交时于服务端二次校验（时钟边界以服务端为准）。
+    scheduled_at: datetime
+    # 撤回原因：非空白；生效后作为快照撤回原因，仅维护侧可见
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def _timezone_required_and_reason_non_blank(self):
+        if self.scheduled_at.tzinfo is None:
+            raise ValueError("scheduled_at must be an timezone-aware datetime")
+        if not self.reason.strip():
+            raise ValueError("reason must not be blank")
+        return self
+
+
+class SnapshotWithdrawalPlanInfo(BaseModel):
+    """定时撤回计划详情：只含计划与撤回元数据，绝不返回快照原文。"""
+
+    plan_id: UUID
+    snapshot_id: UUID
+    # pending / completed / cancelled / superseded
+    status: str
+    # 服务端统一回显为 UTC 的预定撤回时刻
+    scheduled_at: datetime
+    reason: str
+    created_at: datetime
+    # 计划终结时刻：completed 时等于 scheduled_at；cancelled/superseded 为操作时刻；
+    # pending 时为 null
+    ended_at: datetime | None = None
+    # completed 时为快照实际撤回时间（与 scheduled_at 一致）；其余状态为 null
+    withdrawn_at: datetime | None = None
+
+
+class SnapshotWithdrawalPlanCreateResponse(SnapshotWithdrawalPlanInfo):
+    """创建/重复提交回执：replayed=true 表示本次未新建计划，原样回放已有有效计划。"""
+
+    replayed: bool = False
+
+
+class SnapshotWithdrawalPlanCancelResponse(SnapshotWithdrawalPlanInfo):
+    """取消回执：仅 pending 计划可取消，成功时 status=cancelled。"""
+
+
 # ---- 记录临时冻结（机构维护侧；原因不向公开侧透露） ----
 
 

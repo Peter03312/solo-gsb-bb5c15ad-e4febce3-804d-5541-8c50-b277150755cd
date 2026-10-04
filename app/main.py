@@ -14,7 +14,8 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, selectinload
 
-from .db import get_db
+from .config import settings
+from .db import SessionLocal, get_db
 from .migrations import (
     TARGET_SCHEMA_VERSION,
     MigrationFailedError,
@@ -45,7 +46,12 @@ from .models import (
     SENSITIVE_PHRASE_SETTINGS_ID,
     SensitivePhraseSettings,
     Snapshot,
+    SnapshotWithdrawalPlan,
     VersionOriginalDestruction,
+    WITHDRAWAL_PLAN_CANCELLED,
+    WITHDRAWAL_PLAN_COMPLETED,
+    WITHDRAWAL_PLAN_PENDING,
+    WITHDRAWAL_PLAN_SUPERSEDED,
 )
 from .redaction import (
     IntervalOutOfBoundsError,
@@ -93,6 +99,10 @@ from .schemas import (
     SnapshotInfo,
     SnapshotWithdrawRequest,
     SnapshotWithdrawResponse,
+    SnapshotWithdrawalPlanCancelResponse,
+    SnapshotWithdrawalPlanCreate,
+    SnapshotWithdrawalPlanCreateResponse,
+    SnapshotWithdrawalPlanInfo,
     TokenStatusResponse,
     VersionOriginalDestroyRequest,
     VersionOriginalDestroyResponse,
@@ -169,16 +179,188 @@ def _init_db_with_retry() -> None:
         _set_upgrade_state(UPGRADE_STATUS_FAILED, error=str(exc))
 
 
+# ---- 快照定时永久撤回：到期结算（惰性 + 后台轮询双保险） ----
+
+
+# 后台线程单轮最多结算的快照数；未处理完的计划留待下一轮（轮询间隔见配置）
+WITHDRAWAL_DUE_BATCH_SIZE = 200
+
+
+def _settle_snapshot_withdrawal_plans(db: Session, snapshot: Snapshot, now: datetime) -> None:
+    """在已持有的快照行锁内结算该快照的定时撤回计划；调用方负责加锁与提交。
+
+    - 快照仍公开且存在已到点（scheduled_at <= now）的 pending 计划：
+      以**预定时刻**为撤回时间、以**计划原因**为撤回原因执行撤回，
+      计划置 completed、ended_at 取预定时刻；
+    - 快照已撤回（手动撤回或本函数刚完成）：仍挂着的 pending 计划全部置
+      superseded 并以 now 终结——手动撤回先发生时计划即终止，撤回时间与原因
+      一律以手动撤回为准。
+
+    幂等且多实例安全：仅命中 status='pending' 的行；并发结算在快照行锁上
+    排队，后到者看到终态后无操作，恰好生效一次。不提交事务，由调用方提交。
+    """
+    due_plan = db.execute(
+        select(SnapshotWithdrawalPlan)
+        .where(
+            SnapshotWithdrawalPlan.snapshot_id == snapshot.id,
+            SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+            SnapshotWithdrawalPlan.scheduled_at <= now,
+        )
+        .order_by(SnapshotWithdrawalPlan.scheduled_at)
+        .with_for_update()
+        .limit(1)
+    ).scalar_one_or_none()
+    if snapshot.withdrawn_at is None and due_plan is not None:
+        # 计划到点即视为撤回：撤回时间取预定时刻（而非结算发生时刻），原因取计划原因。
+        snapshot.withdrawn_at = due_plan.scheduled_at
+        snapshot.withdraw_reason = due_plan.reason
+        due_plan.status = WITHDRAWAL_PLAN_COMPLETED
+        due_plan.ended_at = due_plan.scheduled_at
+        # 防御性：部分唯一索引保证每快照至多一个 pending 计划，此更新正常无额外命中
+        db.execute(
+            update(SnapshotWithdrawalPlan)
+            .where(
+                SnapshotWithdrawalPlan.snapshot_id == snapshot.id,
+                SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+                SnapshotWithdrawalPlan.id != due_plan.id,
+            )
+            .values(status=WITHDRAWAL_PLAN_SUPERSEDED, ended_at=now)
+        )
+        return
+    if snapshot.withdrawn_at is not None:
+        # 手动撤回先发生（或计划已在上一分支完成）：仍挂着的有效计划全部终止，
+        # 绝不改写既有撤回时间与原因。
+        db.execute(
+            update(SnapshotWithdrawalPlan)
+            .where(
+                SnapshotWithdrawalPlan.snapshot_id == snapshot.id,
+                SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+            )
+            .values(status=WITHDRAWAL_PLAN_SUPERSEDED, ended_at=now)
+        )
+
+
+def settle_due_withdrawals_once(db: Session, now: datetime | None = None) -> int:
+    """扫描并结算一批已到点的定时撤回计划（每个快照独立短事务）。
+
+    供后台调度线程与测试调用：扫描索引上最早到期的一批 pending 计划，
+    按快照逐个在“快照行 -> 计划行”的固定锁序内结算并提交。多实例并发扫描
+    到同一批计划也安全——行锁串行化，落选实例的条件 UPDATE 无命中，不会
+    重复撤回。返回本轮真正发生状态终结的快照数。
+    """
+    now = now or datetime.now(timezone.utc)
+    due_snapshot_ids = (
+        db.execute(
+            select(SnapshotWithdrawalPlan.snapshot_id)
+            .where(
+                SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+                SnapshotWithdrawalPlan.scheduled_at <= now,
+            )
+            .order_by(SnapshotWithdrawalPlan.scheduled_at)
+            .limit(WITHDRAWAL_DUE_BATCH_SIZE)
+        )
+        .scalars()
+        .all()
+    )
+    db.rollback()  # 只读扫描结束，释放事务后逐快照开新短事务，缩短持锁时间
+    settled = 0
+    for snapshot_id in due_snapshot_ids:
+        worker_db = SessionLocal()
+        try:
+            snapshot = worker_db.execute(
+                select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
+            ).scalar_one_or_none()
+            if snapshot is None:
+                worker_db.rollback()
+                continue
+            due_here = worker_db.execute(
+                select(SnapshotWithdrawalPlan.id)
+                .where(
+                    SnapshotWithdrawalPlan.snapshot_id == snapshot_id,
+                    SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+                )
+                .with_for_update()
+            ).scalars().all()
+            if not due_here:
+                # 已被其他实例/请求结算：本次无终结
+                worker_db.rollback()
+                continue
+            was_public = snapshot.withdrawn_at is None
+            _settle_snapshot_withdrawal_plans(worker_db, snapshot, now)
+            worker_db.commit()
+            # 本轮在本快照完成了“计划到点撤回”或“已撤回快照的在途计划终止”
+            if was_public or snapshot.withdrawn_at is not None:
+                settled += 1
+        except Exception:
+            worker_db.rollback()
+            logger.exception("failed to settle due withdrawal plan for snapshot %s", snapshot_id)
+        finally:
+            worker_db.close()
+    return settled
+
+
+class _WithdrawalScheduler:
+    """定时撤回后台结算线程：每个 API 实例各跑一个，只做到期兜底。
+
+    正确性不依赖本线程：所有会触及快照行锁的请求路径（公开读取、手动撤回、
+    发布/复核等）都在锁内先惰性结算到期计划。本线程保证“无人访问的快照”
+    到点后也能及时落库；线程崩溃、服务重启或多实例并发都不影响语义——
+    计划持久化在库中，行锁与条件 UPDATE 保证恰好生效一次，绝不漏执行。
+    """
+
+    def __init__(self) -> None:
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        # 幂等：测试中重复进入 lifespan（或多实例同进程模拟）也只启动一个线程
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="snapshot-withdrawal-scheduler", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and threading.current_thread() is not thread:
+            thread.join(timeout=5)
+        self._thread = None
+
+    def _run(self) -> None:
+        while not self._stop.wait(settings.withdrawal_schedule_poll_seconds):
+            try:
+                db = SessionLocal()
+                try:
+                    settle_due_withdrawals_once(db)
+                finally:
+                    db.close()
+            except Exception:
+                logger.exception("scheduled withdrawal settlement tick failed")
+
+
+_withdrawal_scheduler = _WithdrawalScheduler()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_db_with_retry()
-    yield
+    if get_upgrade_state()["status"] == UPGRADE_STATUS_READY:
+        # 仅升级成功、版本核对通过后才启动定时撤回结算线程；升级失败时全部门禁
+        # 503，无需结算。重启/多实例下计划在库，任一线程/任一实例都会结算到期计划。
+        _withdrawal_scheduler.start()
+    try:
+        yield
+    finally:
+        _withdrawal_scheduler.stop()
 
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.10.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 历史版本原文销毁 + 版本化数据库升级）",
+    version="1.11.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 快照定时撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 历史版本原文销毁 + 版本化数据库升级）",
     lifespan=lifespan,
 )
 
@@ -667,8 +849,11 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
         .where(Snapshot.record_id == record_id, Snapshot.version == payload.version)
         .with_for_update()
     ).scalar_one()
+    # 到点的定时撤回计划先在快照行锁内结算，再判定撤回状态：
+    # 计划到点后该版本不能通过再次直接发布重新公开。结算先提交落库，再返回 409。
+    _settle_snapshot_withdrawal_plans(db, snapshot, datetime.now(timezone.utc))
     if snapshot.withdrawn_at is not None:
-        db.rollback()
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="snapshot has been withdrawn and cannot be published again",
@@ -751,17 +936,24 @@ def submit_publish_request(
             status_code=status.HTTP_409_CONFLICT,
             detail="original text of this record version has been destroyed",
         )
+    # 锁序恒为“版本行 -> 快照行”，与直接发布/公开读取同序，不引入死锁环。
     existing_snapshot = db.execute(
-        select(Snapshot).where(
+        select(Snapshot)
+        .where(
             Snapshot.record_id == record_id, Snapshot.version == payload.version
         )
+        .with_for_update()
     ).scalar_one_or_none()
-    if existing_snapshot is not None and existing_snapshot.withdrawn_at is not None:
-        # 已永久撤回的版本不能再提交受控申请（冻结内容也不会重新公开）
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="snapshot of this version has been withdrawn",
-        )
+    if existing_snapshot is not None:
+        # 到点的定时撤回计划先结算，再判定：已永久撤回的版本不能再提交受控申请。
+        # 结算先提交落库，再返回 409。
+        _settle_snapshot_withdrawal_plans(db, existing_snapshot, datetime.now(timezone.utc))
+        if existing_snapshot.withdrawn_at is not None:
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="snapshot of this version has been withdrawn",
+            )
     _validate_expiry_policy(payload.expires_in_seconds, payload.expires_at)
     expires_at = payload.expires_at
     if expires_at is not None and expires_at.tzinfo is None:
@@ -901,9 +1093,11 @@ def approve_publish_request(
         )
         .with_for_update()
     ).scalar_one()
+    # 申请等待期间到点的定时撤回计划先结算：到点即撤回，不能批准重新公开（仍可驳回）。
+    # 结算先提交落库，再返回 409。
+    _settle_snapshot_withdrawal_plans(db, snapshot, now)
     if snapshot.withdrawn_at is not None:
-        # 申请等待期间该版本快照被永久撤回：不能批准重新公开（仍可驳回本申请）
-        db.rollback()
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="snapshot of this version has been withdrawn",
@@ -1052,19 +1246,28 @@ def submit_bundle_request(
     """
     snapshot_ids = list(dict.fromkeys(payload.snapshot_ids))  # 去重保序（重复已在 schema 拒绝）
     snapshots = (
-        db.execute(select(Snapshot).where(Snapshot.id.in_(snapshot_ids)))
+        db.execute(
+            select(Snapshot).where(Snapshot.id.in_(snapshot_ids)).with_for_update()
+        )
         .scalars()
         .all()
     )
     by_id = {snapshot.id: snapshot for snapshot in snapshots}
     missing = [sid for sid in snapshot_ids if sid not in by_id]
     if missing:
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="snapshot not found"
         )
+    # 到点的定时撤回计划在快照行锁内先结算，再按当前状态判定
+    settle_now = datetime.now(timezone.utc)
+    for sid in snapshot_ids:
+        _settle_snapshot_withdrawal_plans(db, by_id[sid], settle_now)
     withdrawn = [sid for sid in snapshot_ids if by_id[sid].withdrawn_at is not None]
     if withdrawn:
-        # 已撤回快照不能进入共享凭证；批准时还会重新核对
+        # 已撤回快照不能进入共享凭证；批准时还会重新核对。
+        # 可能包含本轮到期结算，先提交落库，再返回 409。
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="one or more snapshots have been withdrawn",
@@ -1134,21 +1337,29 @@ def approve_bundle_request(
         )
 
     snapshot_ids = [UUID(sid) for sid in request.frozen_snapshot_ids]
-    # 批准时重新核对：对全部快照行加锁，任一项失效则整次批准失败、不签发凭证。
-    # FOR UPDATE 与撤回操作串行化；撤回提交后才进入核对的批准必定看到失效项。
+    # 批准时重新核对：对全部快照行加锁（按 id 定序，避免多实例/多事务交叉加锁死锁），
+    # 任一项失效则整次批准失败、不签发凭证。FOR UPDATE 与撤回/定时撤回结算串行化；
+    # 撤回提交（含到点计划结算）后才进入核对的批准必定看到失效项。
     snapshots = (
         db.execute(
-            select(Snapshot).where(Snapshot.id.in_(snapshot_ids)).with_for_update()
+            select(Snapshot)
+            .where(Snapshot.id.in_(snapshot_ids))
+            .order_by(Snapshot.id)
+            .with_for_update()
         )
         .scalars()
         .all()
     )
     by_id = {snapshot.id: snapshot for snapshot in snapshots}
+    settle_now = datetime.now(timezone.utc)
+    for sid in sorted(by_id):
+        _settle_snapshot_withdrawal_plans(db, by_id[sid], settle_now)
     if len(by_id) != len(snapshot_ids) or any(
         sid not in by_id or by_id[sid].withdrawn_at is not None for sid in snapshot_ids
     ):
-        # 申请保持 pending：不签发凭证，本次批准失败，但申请仍可被驳回
-        db.rollback()
+        # 申请保持 pending：不签发凭证，本次批准失败，但申请仍可被驳回。
+        # 可能包含本轮到期结算，先提交落库，再返回 409。
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="one or more snapshots in the frozen list are no longer available",
@@ -1713,38 +1924,242 @@ def withdraw_snapshot(
 
     - 未知快照 -> 404；缺失/错误服务密钥 -> 401；
     - 首次撤回必须提供非空白原因 -> 422；
-    - 条件 UPDATE 只命中未撤回行：并发撤回恰好一个成功，
-      落选方随后读回首次撤回时间与状态，结果幂等。
+    - 快照行锁先于一切状态判定：到点的定时撤回计划在同一事务惰性结算
+      （撤回时间取预定时刻、原因取计划原因），故“计划先到点”时本次调用只
+      回放首次结果，不能改写原因；
+    - 快照仍公开且计划尚未到点时：以当前时刻与本次原因完成手动撤回，并在同一
+      事务把有效计划置为 superseded——手动撤回先发生时以手动撤回时间和原因为准；
+    - 并发手动撤回由快照行锁串行化，恰好一个首次结果。
     """
-    snapshot = db.get(Snapshot, snapshot_id)
+    snapshot = db.execute(
+        select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
+    ).scalar_one_or_none()
     if snapshot is None:
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="snapshot not found"
         )
-    if snapshot.withdrawn_at is None and not (payload.reason and payload.reason.strip()):
+    now = datetime.now(timezone.utc)
+    # 先在快照行锁内结算到点计划：计划先到时快照在此变为已撤回（原因=计划原因）
+    _settle_snapshot_withdrawal_plans(db, snapshot, now)
+    if snapshot.withdrawn_at is not None:
+        # 计划到点（或此前已撤回）：回放首次撤回时间与原因，绝不改写；
+        # 先提交可能在本轮完成的到期结算。
+        db.commit()
+        withdrawn_at = snapshot.withdrawn_at
+    elif not (payload.reason and payload.reason.strip()):
+        # 快照仍公开、手动撤回缺原因：422，不撤回、不改变有效计划
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="reason is required when withdrawing a snapshot",
         )
-    # 原子条件更新：只有未撤回行能命中，首次撤回时间由此固定，永不被覆盖。
-    withdrawn_at = db.execute(
-        update(Snapshot)
-        .where(Snapshot.id == snapshot_id, Snapshot.withdrawn_at.is_(None))
-        .values(withdrawn_at=func.now(), withdraw_reason=payload.reason)
-        .returning(Snapshot.withdrawn_at)
-    ).scalar_one_or_none()
-    if withdrawn_at is None:
-        # 已被（并发的）首次撤回终结：回滚本次更新，读回首次结果
-        db.rollback()
-        snapshot = db.get(Snapshot, snapshot_id)
-        withdrawn_at = snapshot.withdrawn_at
     else:
+        # 手动撤回：撤回时间与原因以本次提交为准，并终止尚未到点的有效计划
+        snapshot.withdrawn_at = now
+        snapshot.withdraw_reason = payload.reason
+        _settle_snapshot_withdrawal_plans(db, snapshot, now)  # 终止 pending 计划
         db.commit()
+        withdrawn_at = now
     return SnapshotWithdrawResponse(
         snapshot_id=snapshot_id,
         withdrawn_at=withdrawn_at,
         status=SNAPSHOT_WITHDRAWN_STATUS,
     )
+
+
+# ---- 快照定时永久撤回计划（机构维护侧：安排 / 查询 / 取消） ----
+
+
+def _plan_info(plan: SnapshotWithdrawalPlan) -> SnapshotWithdrawalPlanInfo:
+    """组装计划详情：completed 时 withdrawn_at 取终结时刻（即预定时刻），其余为 null。"""
+    withdrawn_at = (
+        plan.ended_at if plan.status == WITHDRAWAL_PLAN_COMPLETED else None
+    )
+    return SnapshotWithdrawalPlanInfo(
+        plan_id=plan.id,
+        snapshot_id=plan.snapshot_id,
+        status=plan.status,
+        scheduled_at=plan.scheduled_at,
+        reason=plan.reason,
+        created_at=plan.created_at,
+        ended_at=plan.ended_at,
+        withdrawn_at=withdrawn_at,
+    )
+
+
+@app.post(
+    "/snapshot-withdrawal-plans",
+    response_model=SnapshotWithdrawalPlanCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_service_key)],
+)
+def create_snapshot_withdrawal_plan(
+    payload: SnapshotWithdrawalPlanCreate, db: Session = Depends(get_db)
+):
+    """为已发布快照安排一次未来的永久撤回。
+
+    维护人员凭服务密钥提交快照标识、带时区且晚于服务端当前时刻的撤回时间与
+    非空原因。
+
+    - 未知快照 -> 404；已撤回快照（含到点计划刚结算的）-> 409；缺/错密钥 -> 401；
+    - 预定时刻缺时区 -> 422（请求 schema）；不晚于服务端当前时刻 -> 422；
+      空白原因 -> 422；
+    - 同一快照同时只能有一个有效（pending）计划：
+      - 已存在有效计划且预定时刻与原因完全相同 -> 视为重复提交，返回 200 与
+        原计划（replayed=true，不新建）；
+      - 已存在有效计划但时间或原因不同 -> 409，须先取消原计划再重新安排；
+    - 到点的旧计划在快照行锁内先惰性结算，再按已撤回快照处理（409）；
+    - 并发安排由快照行锁 + “每快照至多一个 pending 计划”的部分唯一索引串行化，
+      恰好建立一个有效计划。
+    """
+    scheduled_at = payload.scheduled_at.astimezone(timezone.utc)
+    snapshot = db.execute(
+        select(Snapshot).where(Snapshot.id == payload.snapshot_id).with_for_update()
+    ).scalar_one_or_none()
+    if snapshot is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="snapshot not found"
+        )
+    now = datetime.now(timezone.utc)
+    # 到点计划先结算（“计划先到时”由其完成撤回，重复安排按已撤回快照 409）
+    _settle_snapshot_withdrawal_plans(db, snapshot, now)
+    if snapshot.withdrawn_at is not None:
+        # 可能是本轮到期结算刚生效：先提交结算，再按已撤回快照拒绝
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="snapshot has already been withdrawn",
+        )
+    if scheduled_at <= now:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="scheduled_at must be later than the server's current time",
+        )
+    active = db.execute(
+        select(SnapshotWithdrawalPlan)
+        .where(
+            SnapshotWithdrawalPlan.snapshot_id == snapshot.id,
+            SnapshotWithdrawalPlan.status == WITHDRAWAL_PLAN_PENDING,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if active is not None:
+        if active.scheduled_at == scheduled_at and active.reason == payload.reason:
+            # 重复提交相同内容：原样回放已有有效计划，不新建、不改变任何状态
+            response = SnapshotWithdrawalPlanCreateResponse(
+                **_plan_info(active).model_dump(), replayed=True
+            )
+            db.rollback()  # 只读回放，释放快照行锁
+            return JSONResponse(status_code=status.HTTP_200_OK, content=response.model_dump(mode="json"))
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "an active withdrawal plan already exists for this snapshot; "
+                "cancel it before scheduling a different time or reason",
+                "plan_id": str(active.id),
+                "scheduled_at": active.scheduled_at.isoformat(),
+            },
+        )
+    plan = SnapshotWithdrawalPlan(
+        snapshot_id=snapshot.id,
+        scheduled_at=scheduled_at,
+        reason=payload.reason,
+        created_at=now,
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return SnapshotWithdrawalPlanCreateResponse(**_plan_info(plan).model_dump(), replayed=False)
+
+
+@app.get(
+    "/snapshot-withdrawal-plans/{plan_id}",
+    response_model=SnapshotWithdrawalPlanInfo,
+    dependencies=[Depends(require_service_key)],
+)
+def get_snapshot_withdrawal_plan(plan_id: UUID, db: Session = Depends(get_db)):
+    """查询定时撤回计划（服务密钥）。
+
+    返回计划编号、快照、状态、预定时刻、原因、创建与终结时刻。计划查询在
+    快照行锁内先做到期结算：到点计划立刻反映为 completed 且快照已撤回。
+    未知计划 -> 404，缺/错密钥 -> 401。
+    """
+    plan = db.get(SnapshotWithdrawalPlan, plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="withdrawal plan not found"
+        )
+    if plan.status == WITHDRAWAL_PLAN_PENDING:
+        # 固定锁序“快照行 -> 计划行”：与结算/取消/手动撤回串行化，无锁序环
+        snapshot = db.execute(
+            select(Snapshot).where(Snapshot.id == plan.snapshot_id).with_for_update()
+        ).scalar_one()
+        db.execute(
+            select(SnapshotWithdrawalPlan)
+            .where(SnapshotWithdrawalPlan.id == plan.id)
+            .with_for_update()
+        ).scalar_one()
+        _settle_snapshot_withdrawal_plans(db, snapshot, datetime.now(timezone.utc))
+        db.commit()
+        db.refresh(plan)
+    return _plan_info(plan)
+
+
+@app.post(
+    "/snapshot-withdrawal-plans/{plan_id}/cancel",
+    response_model=SnapshotWithdrawalPlanCancelResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def cancel_snapshot_withdrawal_plan(plan_id: UUID, db: Session = Depends(get_db)):
+    """在定时撤回计划生效前取消它（服务密钥）。
+
+    - 仅 pending 计划可取消：取消在快照行锁内先做到期结算，计划恰在此时到点
+      则结算生效（completed、快照撤回），本次取消明确拒绝（409）；
+    - 已完成（已生效）/已取消/已被手动撤回终止（superseded）的计划一律 409，
+      不改变任何状态；
+    - 未知计划 -> 404，缺/错密钥 -> 401。取消后同一快照可重新安排计划。
+    """
+    plan = db.get(SnapshotWithdrawalPlan, plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="withdrawal plan not found"
+        )
+    snapshot = db.execute(
+        select(Snapshot).where(Snapshot.id == plan.snapshot_id).with_for_update()
+    ).scalar_one()
+    db.execute(
+        select(SnapshotWithdrawalPlan)
+        .where(SnapshotWithdrawalPlan.id == plan.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+    now = datetime.now(timezone.utc)
+    # 到期结算优先：到点即撤回，取消不得再生效
+    _settle_snapshot_withdrawal_plans(db, snapshot, now)
+    # autoflush=False：先 flush 把结算中对计划行的改写落库，再从库内重载计划行——
+    # 结算的 supersede 分支是 Core 批量 UPDATE，不会同步本会话身份映射中的对象，
+    # 必须以库内（本事务内）最新状态判定取消资格，不能用可能过期的 plan.status。
+    db.flush()
+    db.refresh(plan)
+    if plan.status != WITHDRAWAL_PLAN_PENDING:
+        # 可能是本轮结算刚让计划到点生效：先提交结算，再拒绝取消
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "withdrawal plan is no longer active and cannot be cancelled",
+                "status": plan.status,
+            },
+        )
+    plan.status = WITHDRAWAL_PLAN_CANCELLED
+    plan.ended_at = now
+    db.commit()
+    db.refresh(plan)
+    return SnapshotWithdrawalPlanCancelResponse(**_plan_info(plan).model_dump())
 
 
 @app.get(
@@ -2147,9 +2562,25 @@ def read_snapshot(
     snapshot = db.execute(
         select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
     ).scalar_one_or_none()
-    if snapshot is None or snapshot.withdrawn_at is not None:
+    if snapshot is None:
         # 不区分“快照不存在 / 已撤回 / 已冻结 / 阅览窗口外 / 令牌或凭证无效 / 已撤销 / 已过期 / 次数用尽 / 不在清单”，
-        # 快照不存在或已撤回时直接拒绝，不触碰任何读取计数，也不写审计事件。
+        # 快照不存在时直接拒绝，不触碰任何读取计数，也不写审计事件。
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+        )
+    read_now = datetime.now(timezone.utc)
+    # 定时撤回计划到点即在此（快照行锁内）惰性结算：结算提交后本次读取按既有
+    # “已撤回快照”路径处理——模糊 403、不扣单令牌或共享凭证额度、不写成功审计。
+    if snapshot.withdrawn_at is None:
+        _settle_snapshot_withdrawal_plans(db, snapshot, read_now)
+        if snapshot.withdrawn_at is not None:
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+            )
+    if snapshot.withdrawn_at is not None:
+        # 已撤回（手动撤回或到点计划）：不触碰任何读取计数，也不写审计事件。
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
@@ -2175,7 +2606,7 @@ def read_snapshot(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
         )
-    now = datetime.now(timezone.utc)
+    now = read_now
     # 外部阅览时段（随快照首次发布固定）：仅在 [window_open_at, window_close_at)
     # 内放行，开放时刻起含、截止时刻前不含，以服务端资格判定时刻 now 为准。
     # 窗口外沿用与撤回/冻结完全一致的模糊 403：不区分原因，不执行任何计数 UPDATE
