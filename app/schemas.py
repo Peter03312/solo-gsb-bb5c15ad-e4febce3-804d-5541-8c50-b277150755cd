@@ -80,6 +80,69 @@ class SnapshotWithdrawResponse(BaseModel):
     status: str
 
 
+# ---- 快照计划撤回（机构维护侧：安排未来时刻永久撤回，到点即视为撤回） ----
+
+
+class WithdrawalScheduleCreateRequest(BaseModel):
+    """安排未来永久撤回：预定时刻必须带时区且晚于服务端当前时刻（端点内核对）。"""
+
+    # 预定撤回时刻：必须带时区（Z 或 +08:00 等偏移）；naive 时刻一律 422，
+    # 不做“按 UTC 猜测”的隐式解释
+    scheduled_at: datetime
+    # 撤回原因：非空白（端点内 422 校验，与手动撤回/冻结/销毁同一风格）
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def _scheduled_at_must_be_timezone_aware(self):
+        if self.scheduled_at.tzinfo is None:
+            raise ValueError("scheduled_at must include a timezone offset")
+        return self
+
+
+class WithdrawalScheduleInfo(BaseModel):
+    """撤回计划详情：计划编号、快照、预定时刻、原因、状态与各终态时间。"""
+
+    schedule_id: UUID
+    snapshot_id: UUID
+    # 预定撤回时刻：到点即视为撤回（快照的撤回时刻即取它）
+    scheduled_at: datetime
+    reason: str
+    # scheduled（有效，生效前可取消）/ executed（已生效）/
+    # canceled（已取消）/ superseded（手动撤回先发生，计划终止）
+    status: str
+    created_at: datetime
+    # 实际结算落库时刻（executed 时非空）
+    executed_at: datetime | None = None
+    # 取消时刻（canceled 时非空）
+    canceled_at: datetime | None = None
+    # 被手动撤回取代的时刻（superseded 时非空）
+    superseded_at: datetime | None = None
+
+
+class WithdrawalScheduleCreateResponse(WithdrawalScheduleInfo):
+    """提交结果：重复提交相同内容返回原计划（replayed=true），不新建计划。"""
+
+    replayed: bool = False
+
+
+class WithdrawalScheduleListResponse(BaseModel):
+    """某快照的全部撤回计划（含历史终态计划，按提交时间升序）。"""
+
+    snapshot_id: UUID
+    schedules: list[WithdrawalScheduleInfo]
+
+
+class WithdrawalScheduleCancelResponse(BaseModel):
+    """取消结果：已取消/已被取代的计划重复取消幂等回放（already_canceled=true）。"""
+
+    schedule_id: UUID
+    snapshot_id: UUID
+    status: str
+    canceled_at: datetime | None = None
+    superseded_at: datetime | None = None
+    already_canceled: bool = False
+
+
 # ---- 记录临时冻结（机构维护侧；原因不向公开侧透露） ----
 
 

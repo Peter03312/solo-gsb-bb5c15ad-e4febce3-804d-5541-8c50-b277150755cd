@@ -186,6 +186,84 @@ class Snapshot(Base):
     )
 
 
+# 快照计划撤回的状态
+SCHEDULE_STATUS_SCHEDULED = "scheduled"  # 有效计划：等待到点生效，生效前可取消
+SCHEDULE_STATUS_EXECUTED = "executed"  # 已生效：到点结算，快照已按计划时刻与原因撤回
+SCHEDULE_STATUS_CANCELED = "canceled"  # 已取消：生效前被维护人员取消
+SCHEDULE_STATUS_SUPERSEDED = "superseded"  # 被取代：手动撤回先发生，计划终止
+SCHEDULE_STATUSES = (
+    SCHEDULE_STATUS_SCHEDULED,
+    SCHEDULE_STATUS_EXECUTED,
+    SCHEDULE_STATUS_CANCELED,
+    SCHEDULE_STATUS_SUPERSEDED,
+)
+
+
+class WithdrawalSchedule(Base):
+    """快照未来永久撤回计划：到点即视为撤回（维护侧安排、生效前可取消）。
+
+    - 同一快照同时至多一个有效计划（status='scheduled'）：部分唯一索引
+      uq_withdrawal_schedules_active 兜底，应用层以快照行锁串行化同一快照的
+      全部计划操作（提交/取消/结算/手动撤回取代）；
+    - 到点（scheduled_at <= 服务端当前时刻）即视为撤回：公开读取、手动撤回、
+      发布/批准与后台执行器都会在快照行锁内把到点计划结算为
+      “快照 withdrawn_at=scheduled_at、withdraw_reason=计划原因、计划 executed”，
+      计划持久化在库，服务重启或多实例运行都不会漏执行；
+    - 生效前可取消（canceled）；手动撤回先发生则计划终止（superseded），
+      以手动撤回的时间与原因为准；计划先到时则手动撤回只回放首次结果；
+    - 终态（executed/canceled/superseded）不可变更，历史计划逐次留存。
+    """
+
+    __tablename__ = "withdrawal_schedules"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('scheduled', 'executed', 'canceled', 'superseded')",
+            name="ck_withdrawal_schedules_status",
+        ),
+        # 同一快照至多一个有效（scheduled）计划（PostgreSQL 部分唯一索引）
+        Index(
+            "uq_withdrawal_schedules_active",
+            "snapshot_id",
+            unique=True,
+            postgresql_where=text("status = 'scheduled'"),
+        ),
+        # 后台执行器扫描到点计划
+        Index("ix_withdrawal_schedules_due", "status", "scheduled_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False
+    )
+    # 预定撤回时刻（带时区）：到点即视为撤回，快照的 withdrawn_at 即取该时刻
+    scheduled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # 撤回原因（非空白）：计划生效时原样落到快照的 withdraw_reason；仅维护侧可见
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default=SCHEDULE_STATUS_SCHEDULED,
+        default=SCHEDULE_STATUS_SCHEDULED,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # 实际结算落库时刻（executed 时非空）；重启/多实例补执行时可能略晚于预定时刻
+    executed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 取消时刻（canceled 时非空）
+    canceled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 被手动撤回取代的时刻（superseded 时非空）
+    superseded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class ReadToken(Base):
     """快照的随机读取令牌，可设到期时间、可撤销，并可设成功读取次数上限。
 

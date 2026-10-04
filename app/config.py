@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     # 启动时等待数据库就绪的重试参数
     db_connect_retries: int = 30
     db_connect_retry_delay_seconds: float = 1.0
+    # 快照计划撤回后台执行器的扫描间隔（秒）：到点计划按此周期被结算为已撤回。
+    # <=0 表示禁用后台执行器（不推荐：禁用后到点计划仅随公开读取、手动撤回、
+    # 发布/批准等请求路径被动结算，无流量时维护侧状态可能滞后）。
+    withdrawal_scheduler_interval_seconds: float = 1.0
 
     @field_validator("review_credentials")
     @classmethod

@@ -334,6 +334,35 @@ def _migrate_7_version_original_destruction(conn) -> None:
     )
 
 
+def _migrate_8_withdrawal_schedules(conn) -> None:
+    """v8：快照计划撤回表 withdrawal_schedules 与配套索引。
+
+    空库路径下 v1 的 create_all 已按当前模型建出完整表与索引，此处幂等；
+    旧库路径先按当前模型补齐可能缺失的整张表，再以 CREATE INDEX IF NOT
+    EXISTS 收敛“每快照至多一个有效计划”的部分唯一索引与执行器扫描索引。
+
+    只新增结构，不改动任何既有数据：既有快照没有任何撤回计划，
+    发布/公开读取/手动撤回语义完全不变。
+    """
+    Base.metadata.create_all(bind=conn, checkfirst=True)
+    conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_withdrawal_schedules_active
+            ON withdrawal_schedules (snapshot_id) WHERE status = 'scheduled'
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_withdrawal_schedules_due
+            ON withdrawal_schedules (status, scheduled_at)
+            """
+        )
+    )
+
+
 # (版本号, 版本名称, 升级函数)。追加新版本时只允许在末尾追加，永不改写历史版本。
 MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (1, "initial_schema", _migrate_1_initial_schema),
@@ -343,6 +372,7 @@ MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (5, "sensitive_phrases", _migrate_5_sensitive_phrases),
     (6, "snapshot_windows", _migrate_6_snapshot_windows),
     (7, "version_original_destruction", _migrate_7_version_original_destruction),
+    (8, "withdrawal_schedules", _migrate_8_withdrawal_schedules),
 )
 
 TARGET_SCHEMA_VERSION = MIGRATIONS[-1][0]

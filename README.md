@@ -9,6 +9,8 @@
 
 已发布版本若不应继续公开，机构可凭服务密钥将对应**快照永久撤回**：撤回只作用于该快照，同记录其他版本继续可读；撤回后无论持有该快照的哪枚令牌，新开始的公开读取一律沿用模糊 `403 snapshot unavailable` 且不消耗读取次数；该版本再次直接发布、提交受控申请或批准撤回前已在审的申请均返回 `409`，待审申请仍可驳回。
 
+机构也可为已发布快照**安排未来时刻的永久撤回（计划撤回）**：维护人员凭服务密钥提交快照标识、带时区且晚于服务端当前时刻的撤回时间与非空原因，获得计划编号；计划可查询、可在生效前取消。同一快照同时只能有一个有效计划，重复提交相同内容返回原计划，改时间或原因须先取消。**到点即视为撤回**：后台执行器按期结算（服务重启、多实例运行都不漏执行），到点后开始的公开读取沿用同一模糊 `403`、不扣任何凭证额度、不写成功读取审计；手动撤回先发生则以手动撤回的时间和原因为准、计划终止，计划先到时则手动撤回只回放首次结果、不能改写原因。
+
 机构发现某条记录需**临时阻断外部阅览**时，可凭服务密钥提交记录标识与**非空原因**将其**冻结**，并可查询冻结状态、解除冻结。冻结/解除重复操作幂等：**当前冻结期的原因与开始时间绝不被覆盖**，解除后再次冻结开启新冻结期。冻结覆盖该记录**现有及冻结期间新发布的全部快照**：冻结提交后开始的公开读取，即使用有效的单快照令牌或多快照共享凭证，也按既有 `403 snapshot unavailable` 拒绝，**不扣次数、不写成功读取审计**；共享凭证中**其他记录**的快照仍可读。解除冻结**只恢复原本仍有效的读取资格**——已撤回快照、过期/撤销/换发凭证、耗尽额度均不因解除而复活。冻结与并发读取按记录行锁保证**提交边界一致**，冻结原因**仅维护侧可见**；未知记录 `404`、空白原因 `422`、无效密钥 `401`。冻结不影响原有发布、复核与公开读取的鉴权与响应约定。
 
 此外，机构可把**多个已发布快照一次性交给同一外部审阅者**：operator 用本人凭据提交多快照共享凭证申请（**至少两个互不重复的快照 ID**、可选到期策略与**正整数共享读取总额度**，提交时冻结清单），由**另一名 reviewer** 批准或驳回（申请人不得自审）；批准时**重新核对全部快照仍存在且未撤回**，任一项失效则整次批准失败、不签发凭证（申请仍可驳回）。批准成功后**一次性签发随机共享凭证**，绑定冻结清单并**共用读取额度**：凭证在**现有公开快照读取接口**上只能读取清单内快照的脱敏正文，沿用原响应与模糊 403；清单内某项快照后来撤回，只拒绝该项且**不扣额度**，其他项仍可读；到期、撤销或额度耗尽时全部拒绝。维护人员凭服务密钥可查询凭证清单、额度与状态并撤销。
@@ -52,8 +54,10 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 | 4 | `record_freezes` | 记录临时冻结表 `record_freezes` 与“每条记录至多一个当前冻结期”的部分唯一索引；只新增结构，既有记录默认未冻结、全部快照继续按既有资格可读 |
 | 5 | `sensitive_phrases` | 敏感短语清单单行配置表 `sensitive_phrase_settings` 与初始“停用核验”行（空清单、版本 1）；只新增结构，既有发布/读取语义不变 |
 | 6 | `snapshot_windows` | 快照外部阅览时段：`snapshots` 与 `publish_requests` 各增 `window_open_at`/`window_close_at`（带时区、可空）及“成对出现、开放早于截止”CHECK；既有行两列均为 `NULL`（无时段限制），发布/批准/公开读取语义完全不变 |
+| 7 | `version_original_destruction` | 历史版本原文销毁：销毁登记表 `version_original_destructions`（复合外键指向 `record_versions`），并把 `record_versions.original_text` 与 `publish_requests.frozen_text` 两列放开 NOT NULL；只放开约束，绝不清除任何既有原文 |
+| 8 | `withdrawal_schedules` | 快照计划撤回表 `withdrawal_schedules` 与“每快照至多一个有效计划”的部分唯一索引、执行器扫描索引；只新增结构，既有快照没有任何撤回计划，发布/读取/手动撤回语义不变 |
 
-代码支持的最高版本为 6（`/readyz` 的 `supported_schema_version`）。**后续新增变更只能在升级链末尾追加新版本，不得改写历史版本。**
+代码支持的最高版本为 8（`/readyz` 的 `supported_schema_version`）。**后续新增变更只能在升级链末尾追加新版本，不得改写历史版本。**
 
 ### 升级流程与保证
 
@@ -62,8 +66,8 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 1. **等待数据库就绪**（按 `DB_CONNECT_RETRIES` / `DB_CONNECT_RETRY_DELAY_SECONDS` 重试）；
 2. 获取一把固定键的 **PostgreSQL 会话级咨询锁**（`pg_advisory_lock`）：多个实例同时启动时，**只有一个实例（领导者）进入升级**，其余实例在锁上排队等待；
 3. 判定起点：
-   - **空库**（无任何业务表）：从 v1 开始依次建表、补齐、安装防改写触发器、建冻结表、建敏感短语配置表、补快照时段列与约束；
-   - **升级框架出现前的旧库**（有业务表但无 `schema_migrations`）：把既有结构**补登为 v1 基线**（不重放建表、不重写数据），再增量执行 v2、v3、v4、v5、v6、v7；
+   - **空库**（无任何业务表）：从 v1 开始依次建表、补齐、安装防改写触发器、建冻结表、建敏感短语配置表、补快照时段列与约束、建原文销毁登记表、建快照计划撤回表；
+   - **升级框架出现前的旧库**（有业务表但无 `schema_migrations`）：把既有结构**补登为 v1 基线**（不重放建表、不重写数据），再增量执行 v2、v3、v4、v5、v6、v7、v8；
    - **已升级库**：只核对版本，不执行任何变更语句；
 4. **每个版本独立事务**：升级语句、数据回填与该版本记录原子提交；任一语句失败则整个版本回滚且**不登记**，修复后重启可从失败版本安全重试；
 5. 升级完成后核对库版本必须等于代码支持版本，然后释放咨询锁；排队的其余实例拿到锁后看到已是目标版本，仅做核对即放行。
@@ -91,7 +95,7 @@ docker compose up --build -d
 
 # 3) 等待该实例就绪（返回 200 且 schema_version 为目标版本）
 curl -fsS http://localhost:8000/readyz
-# => {"status":"ready","schema_version":7,"supported_schema_version":7}
+# => {"status":"ready","schema_version":8,"supported_schema_version":8}
 
 # 4) 核对升级记录
 docker compose exec db psql -U redact -d redact \
@@ -136,6 +140,7 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
 | `DATABASE_URL` | PostgreSQL 连接串 | `postgresql+psycopg2://redact:redact@localhost:5432/redact` |
 | `DB_CONNECT_RETRIES` | 启动时等待数据库的重试次数 | `30` |
 | `DB_CONNECT_RETRY_DELAY_SECONDS` | 重试间隔（秒） | `1.0` |
+| `WITHDRAWAL_SCHEDULER_INTERVAL_SECONDS` | 快照计划撤回后台执行器的扫描间隔（秒）；`<=0` 禁用后台执行器（不推荐：禁用后到点计划仅随请求路径被动结算，无流量时维护侧状态会滞后） | `1.0` |
 
 维护接口（创建、修订、直接发布、撤销、状态、标记受控）通过请求头 `X-Service-Key` 鉴权；缺失或不符一律 `401` 整次拒绝。
 
@@ -173,6 +178,10 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
 | `GET` | `/tokens/{token}` | 服务密钥 | 查询令牌状态：上限 `max_reads`、已用 `reads_used`、剩余 `remaining_reads`（不含原文） |
 | `POST` | `/tokens/{token}/revoke` | 服务密钥 | 撤销读取令牌（含受控发布签发的令牌） |
 | `POST` | `/snapshots/{snapshot_id}/withdraw` | 服务密钥 | **永久撤回快照**（首次需带 `reason`）；重复撤回返回首次撤回时间与状态 |
+| `POST` | `/snapshots/{snapshot_id}/withdrawal-schedules` | 服务密钥 | **安排未来撤回**：提交带时区的撤回时间与原因，返回计划编号；重复提交相同内容返回原计划，改时间/原因须先取消 |
+| `GET` | `/snapshots/{snapshot_id}/withdrawal-schedules` | 服务密钥 | 列出该快照的全部撤回计划（含历史终态计划） |
+| `GET` | `/withdrawal-schedules/{schedule_id}` | 服务密钥 | 按计划编号查询撤回计划（预定时刻、原因、状态与终态时间） |
+| `POST` | `/withdrawal-schedules/{schedule_id}/cancel` | 服务密钥 | **生效前取消**撤回计划（幂等）；已生效计划的取消明确拒绝 |
 | `GET` | `/records/{record_id}` | 服务密钥 | 查看当前版本、受控标记与快照列表（含撤回时间、原因、状态与外部阅览时段） |
 | `POST` | `/records/{record_id}/freeze` | 服务密钥 | **临时冻结记录**（首次需非空白 `reason`）：覆盖现有及期间新发布的全部快照；重复冻结幂等、不覆盖原因/开始时间 |
 | `GET` | `/records/{record_id}/freeze` | 服务密钥 | 查询当前冻结状态（当前冻结期开始时间、原因；未冻结时各字段为 null） |
@@ -229,6 +238,83 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
   - 撤回前已存在的**待审申请**，批准时 → `409`（不签发令牌），但**仍可驳回**；已批准申请记录继续留存。
 - **状态码**：未知快照 `404`；缺失或错误服务密钥沿用 `401`；首次撤回缺少非空白 `reason` → `422`。
 - **维护侧可见**：`GET /records/{record_id}` 的每个快照条目含 `status`（`published` / `withdrawn`）、`withdrawn_at`、`withdraw_reason`。
+
+### 快照计划撤回（安排未来时刻永久撤回）
+
+机构需要让某个已发布快照在**未来某个时刻自动永久撤回**时，凭服务密钥调用
+`POST /snapshots/{snapshot_id}/withdrawal-schedules`，请求体携带带时区的撤回时间与原因：
+
+```json
+{"scheduled_at": "2026-11-01T00:00:00+08:00", "reason": "保留期届满，到期撤回"}
+```
+
+#### 提交、查询与取消
+
+- **提交**：`scheduled_at` 必须**带时区**（`Z` 或 `+08:00` 等偏移；不带时区的 naive 时刻一律 `422`，不做隐式 UTC 猜测）且**晚于服务端当前时刻**（过去或当前时刻 `422`）；`reason` 必须**非空白**（`422`）。成功返回 `201` 与计划编号、预定时刻、状态：
+  ```json
+  {"schedule_id":"<WSID>","snapshot_id":"<SID>","scheduled_at":"2026-10-31T16:00:00Z",
+   "reason":"保留期届满，到期撤回","status":"scheduled","created_at":"...",
+   "executed_at":null,"canceled_at":null,"superseded_at":null,"replayed":false}
+  ```
+  服务端统一按 UTC 回显预定时刻（按绝对时刻存储，不同时区表达的同一时刻等价）。
+- **同一快照同时只能有一个有效计划**（`status=scheduled`）：
+  - **重复提交相同内容**（预定时刻按绝对时刻相同、原因相同）返回**原计划**（`200`，`replayed=true`），不新建计划；
+  - **改时间或原因**须先取消现有计划，否则 `409`；
+  - 取消后（或既有计划已终结后）可重新安排新计划，历史计划逐次留存可查。
+- **查询**：`GET /withdrawal-schedules/{schedule_id}` 按计划编号查询；`GET /snapshots/{snapshot_id}/withdrawal-schedules` 列出该快照的全部计划（含已终结的历史计划，按提交时间升序）。
+- **取消**：`POST /withdrawal-schedules/{schedule_id}/cancel` 仅在**生效前**成功（`200`，状态转 `canceled`）；重复取消幂等回放（`already_canceled=true`）；**已生效（`executed`）计划的取消明确拒绝 `409`**——取消请求到达时恰好到点的计划会先结算生效，随即同样 `409`。取消后快照公开读取不受影响，可再安排新计划。
+- **状态码**：未知快照/未知计划 `404`；已撤回快照提交计划 `409`；缺失/错误服务密钥 `401`。
+
+#### 到点生效与执行可靠性
+
+- **到点即视为撤回**：预定时刻一到，快照即视为已撤回——快照的 `withdrawn_at` 取**计划预定时刻**（而非结算落库时刻），`withdraw_reason` 取计划原因，计划状态转 `executed`。
+- **执行器 + 请求路径双保险**：每个实例都运行后台执行器，按 `WITHDRAWAL_SCHEDULER_INTERVAL_SECONDS`（默认 1 秒）周期把到点计划结算落库；同时公开读取、手动撤回、直接发布、受控/共享凭证批准等路径也会在快照行锁内**同步结算**该快照的到点计划。计划持久化在数据库，**服务重启后执行器立即补扫、多实例各自运行由快照行锁保证恰好生效一次**，不会漏执行也不会重复生效。
+- **公开侧效果**：到点后开始的公开读取，无论持有该快照的哪枚单快照令牌或多快照共享凭证，一律沿用既有模糊 `403 snapshot unavailable`；这些请求**不扣任何额度、不写成功读取审计**，公开响应不透露计划或原因。计划只作用于该快照：**共享凭证清单内其他快照不受影响**（该项 403 不扣共享额度，其他项仍可读）。
+- **维护侧效果**：到点后该版本再次直接发布、受控批准、共享凭证批准均按既有撤回语义 `409`；`GET /records/{record_id}` 的快照条目显示 `status=withdrawn`、撤回时刻（=预定时刻）与计划原因。
+
+#### 与手动撤回的交互
+
+- **手动撤回先发生**（计划未到点时调用 `POST /snapshots/{id}/withdraw`）：以**手动撤回的时间和原因**为准，该快照的有效计划随即终止（`superseded`），计划到点也不会再生效；已被取代的计划再取消幂等回放（`already_canceled=true`）。
+- **计划先到时**：快照已按计划时刻与原因视为撤回，随后的手动撤回**回放首次结果**（返回计划预定时刻），**不能改写原因**——与重复手动撤回的幂等语义一致。
+
+#### 调用示例
+
+```bash
+KEY=dev-service-key-change-me
+AUTH=(-H "X-Service-Key: $KEY" -H "Content-Type: application/json")
+
+# 1. 安排 2026-11-01 00:00（+08:00）永久撤回（首次 201）
+curl -sS -X POST http://localhost:8000/snapshots/<SID>/withdrawal-schedules "${AUTH[@]}" \
+  -d '{"scheduled_at":"2026-11-01T00:00:00+08:00","reason":"保留期届满，到期撤回"}'
+# => {"schedule_id":"<WSID>","scheduled_at":"2026-10-31T16:00:00Z","status":"scheduled",...}
+
+# 2. 重复提交相同内容（同一绝对时刻的 Z 表达）=> 200 原计划，"replayed":true
+curl -sS -X POST http://localhost:8000/snapshots/<SID>/withdrawal-schedules "${AUTH[@]}" \
+  -d '{"scheduled_at":"2026-10-31T16:00:00Z","reason":"保留期届满，到期撤回"}'
+# 改时间或原因 => 409（须先取消）
+
+# 3. 查询计划
+curl -sS http://localhost:8000/withdrawal-schedules/<WSID> -H "X-Service-Key: $KEY"
+curl -sS http://localhost:8000/snapshots/<SID>/withdrawal-schedules -H "X-Service-Key: $KEY"
+
+# 4. 生效前取消（重复取消幂等）；取消后读取不受影响、可重新安排
+curl -sS -X POST http://localhost:8000/withdrawal-schedules/<WSID>/cancel -H "X-Service-Key: $KEY"
+# => {"status":"canceled","canceled_at":"...","already_canceled":false}
+
+# 5. 到点后：公开读取一律 403 snapshot unavailable（不扣次、不写审计）；
+#    计划状态转 executed，快照 withdrawn_at=预定时刻、withdraw_reason=计划原因
+curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<TOKEN>"
+# => 403 {"detail":"snapshot unavailable"}
+curl -sS http://localhost:8000/withdrawal-schedules/<WSID> -H "X-Service-Key: $KEY"
+# => {"status":"executed","executed_at":"...", ...}
+# 已生效计划的取消 => 409
+```
+
+完整端到端演示（含 401/404/409/422、重复提交幂等、取消与重新安排、到点 403 不扣次、执行器无流量生效、手动撤回与计划的两种先后交互）：
+
+```bash
+./examples/demo_withdrawal_schedule.sh   # 可用 BASE_URL / SERVICE_KEY 覆盖
+```
 
 ### 调用示例
 
@@ -1003,7 +1089,7 @@ KEY=dev-service-key-change-me
 
 # 1) 探针：就绪后才放流量；livez 在升级失败时仍可探活
 curl -fsS "$BASE/readyz"
-# => {"status":"ready","schema_version":7,"supported_schema_version":7}
+# => {"status":"ready","schema_version":8,"supported_schema_version":8}
 curl -s  "$BASE/livez"
 # => {"status":"alive","upgrade_status":"ready"}
 # 升级未就绪/失败时，除 /livez 外一律：
@@ -1048,6 +1134,14 @@ curl -s -X POST "$BASE/records/<RID>/versions/1/destroy-original" \
   -d '{"reason":"保留期届满"}'
 # => 首次 {"record_id":"<RID>","version":1,"destroyed_at":"…","reason":"…","replayed":false}
 #    重复 => 回放首次时间与理由，"replayed":true
+
+# 9) v8 新增的快照计划撤回即可使用：升级只新增计划表，既有快照没有任何计划、
+#    公开读取与手动撤回语义不变；可为存量快照安排未来撤回
+curl -s -X POST "$BASE/snapshots/<SID>/withdrawal-schedules" \
+  -H "X-Service-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"scheduled_at":"2026-12-01T00:00:00Z","reason":"保留期届满，到期撤回"}'
+# => 201 {"schedule_id":"<WSID>","status":"scheduled","scheduled_at":"2026-12-01T00:00:00Z",...}
+#    到点即视为撤回（执行器结算，重启/多实例不漏）；生效前可取消
 ```
 
 ## 设计要点
@@ -1065,6 +1159,12 @@ curl -s -X POST "$BASE/records/<RID>/versions/1/destroy-original" \
   - 公开读取先 `SELECT ... FOR UPDATE` 锁定快照行再判定，撤回与读取按快照行锁串行化：撤回提交后开始的读取在计数 `UPDATE` 之前就收到模糊 403，**不返回正文也不消耗次数**；
   - 直接发布/受控批准在写令牌前以 `FOR UPDATE` 取快照并检查撤回状态，提交受控申请在写申请前检查；已撤回版本的重新公开一律 `409`，但撤回前已在审的申请仍可驳回；
   - 撤回不删除任何数据：历史脱敏正文、同记录其他版本快照、已批准申请记录全部留存，仅公开读取被关闭。
+- **快照计划撤回**：
+  - 新表 `withdrawal_schedules`（`snapshot_id`、带时区 `scheduled_at`、非空 `reason`、`status` 与三个终态时间列）随 v8 迁移幂等创建；`status='scheduled'` 上的**部分唯一索引**保证同一快照至多一个有效计划，执行器扫描索引 `(status, scheduled_at)` 支撑到点计划的高效捞出；只新增结构，既有数据与语义不变；
+  - **快照行锁是同一快照全部计划操作的共用串行点**：提交计划、取消、到点结算、手动撤回取代都先 `SELECT ... FOR UPDATE` 锁快照行再操作计划行（锁序恒为“快照行 → 计划行”，与公开读取的“快照行 → 记录行”等既有锁序兼容，不会死锁）；并发提交相同内容在锁内幂等返回原计划，并发取消与到点结算恰好一个成功；
+  - **到点即视为撤回**：结算把快照 `withdrawn_at` 定为**计划预定时刻**、`withdraw_reason` 定为计划原因、计划转 `executed`；后台执行器（每实例一个守护线程，间隔可配）周期结算全部到点计划，公开读取/手动撤回/直接发布/受控与共享凭证批准路径也在快照行锁内同步结算本快照的到点计划——计划持久化在库，**重启后执行器立即补扫、多实例由快照行锁保证恰好生效一次**，请求路径的同步结算保证到点后的公开读取无需等待执行器即返回模糊 `403`（不扣额度、不写审计）；
+  - 与手动撤回共用同一快照行锁：手动撤回先发生则把有效计划置 `superseded`（以手动时间和原因为准），计划先到时则手动撤回走既有幂等回放（返回计划预定时刻，原因不被改写）；取消仅在生效前成功，已生效计划取消 `409`，已终结计划重复取消幂等回放；
+  - 计划撤回与手动撤回共享同一撤回状态机（`snapshots.withdrawn_at`）：撤回后的发布冲突、公开读取模糊 `403`、不扣次不审计、清单内其他快照不受影响等语义完全复用既有实现。
 - **不泄露原文**：公开接口只返回快照中的脱敏正文；令牌无效/撤销/到期/次数用尽/快照已撤回/记录已冻结/与快照不匹配统一返回模糊的 `403 snapshot unavailable`；维护侧令牌查询与受控申请查询只返回元数据与计数，错误信息不含原文内容，冻结/撤回原因仅维护侧可见。
 - **令牌**：`secrets.token_urlsafe(32)` 随机生成；支持 `expires_in_seconds` 或 `expires_at`（二选一）设置到期时间，并支持可选正整数 `max_reads` 读取次数上限；到期、撤销或次数用尽后读取一律拒绝。直接发布与受控批准共用同一套令牌规则、计数、查询与撤销接口。
 - **受控发布**：
@@ -1115,7 +1215,7 @@ curl -s -X POST "$BASE/records/<RID>/versions/1/destroy-original" \
   - 直接发布与受控申请提交把版本读取改为 `SELECT … FOR UPDATE`，在版本行锁后判定 `original_text IS NULL → 409`；批准在申请行锁（既有）后判定 `frozen_text IS NULL → 409`，申请保持待审、驳回路径完全不变；版本行（发布/提交）与申请行（批准/驳回）分别是销毁与三类操作的共用串行点，因此**严格按事务提交顺序生效**：发布/提交/批准先提交则照常完成（其冻结原文随后被销毁清除，已签发快照/令牌不受影响），销毁先提交则后来者一律拒绝，且销毁提交后版本原文与申请冻结原文均已清空，**不残留可用于签发的原文副本**；
   - 销毁只作用于指定版本：其他版本的修订（条件更新，不读旧原文）与发布、已发布脱敏快照、令牌/共享凭证、额度扣减、成功读取审计与公开读取全部保持原约定，公开响应结构不变、**不透露销毁状态**。
 - **版本化数据库升级**：
-  - 版本表 `schema_migrations(version, name, applied_at)` 与升级链 v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录临时冻结表与部分唯一索引 / v5 敏感短语清单单行配置表与初始停用行 / v6 快照外部阅览时段列与 CHECK / v7 历史版本原文销毁表与两列原文放开 NOT NULL；空库从 v1 依次执行，升级框架出现前的旧库补登 v1 基线后只增量执行 v2/v3/v4/v5/v6/v7，已升级库只核对；
+  - 版本表 `schema_migrations(version, name, applied_at)` 与升级链 v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录临时冻结表与部分唯一索引 / v5 敏感短语清单单行配置表与初始停用行 / v6 快照外部阅览时段列与 CHECK / v7 历史版本原文销毁表与两列原文放开 NOT NULL / v8 快照计划撤回表与部分唯一索引；空库从 v1 依次执行，升级框架出现前的旧库补登 v1 基线后只增量执行 v2/v3/v4/v5/v6/v7/v8，已升级库只核对；
   - 启动先取固定键的 PostgreSQL 会话级**咨询锁**：多实例并发只有一个执行升级，其余等待并在拿到锁后核对版本；进程崩溃则锁随连接释放，失败版本随事务回滚、未登记，重启可重试；
   - **每个版本独立事务**：DDL/回填与版本记录原子提交，已完成步骤绝不重放；回填只作用于 NULL 行，存量记录/快照/凭证、已用额度、换发链标识与审计事件均保留；
   - 升级后核对版本必须等于代码支持版本；库版本高于代码（未知较新版本）或升级失败时进入失败态，中间件对除 `/livez` 外的全部路径返回 `503`（不暴露鉴权/内部细节），`/readyz` 供编排就绪探针，修复后重启可恢复服务。
@@ -1137,6 +1237,8 @@ python3 -m unittest tests.test_config -v
 # 受控发布端到端集成测试：默认用 pgserver 内置 PostgreSQL 自动建临时库，
 # 也可用 TEST_DATABASE_URL 指向已有数据库
 python3 -m unittest tests.test_integration_api -v
+# 快照计划撤回端到端集成测试（提交/幂等/取消/到点生效/执行器/与手动撤回交互）
+python3 -m unittest tests.test_withdrawal_schedule -v
 # 版本化数据库升级测试：空库/旧库升级、数据与链标识保留、未知较新版本拒绝、
 # 失败回滚可重试、多实例并发只有一个执行升级（真实 PostgreSQL）
 python3 -m unittest tests.test_migrations -v
@@ -1146,18 +1248,19 @@ python3 -m unittest tests.test_migrations -v
 
 ```
 app/
-  main.py       # 路由与事务逻辑（受控发布、令牌计数、快照撤回、记录临时冻结、多快照共享凭证申请-复核与共用额度、凭证泄露换发、成功读取审计事件与分页查询、敏感短语清单维护与发布核验、历史版本原文销毁）；启动门禁与 /livez /readyz /healthz
-  migrations.py # 有版本记录的数据库升级：schema_migrations 版本表 + 咨询锁；v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录冻结表与部分唯一索引 / v5 敏感短语配置表 / v6 快照外部阅览时段列与 CHECK / v7 版本原文销毁表与原文列放开 NOT NULL
-  models.py     # records / record_versions(原文可销毁) / snapshots(含撤回字段与外部阅览时段) / record_freezes(冻结期) / read_tokens(含换发链) / publish_requests(含冻结时段,冻结原文可销毁) / read_bundles(+requests/items，含换发链) / credential_rotations / read_audit_events(只追加) / sensitive_phrase_settings(启用清单单行) / version_original_destructions(版本原文销毁登记)
+  main.py       # 路由与事务逻辑（受控发布、令牌计数、快照撤回、快照计划撤回与后台执行器、记录临时冻结、多快照共享凭证申请-复核与共用额度、凭证泄露换发、成功读取审计事件与分页查询、敏感短语清单维护与发布核验、历史版本原文销毁）；启动门禁与 /livez /readyz /healthz
+  migrations.py # 有版本记录的数据库升级：schema_migrations 版本表 + 咨询锁；v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录冻结表与部分唯一索引 / v5 敏感短语配置表 / v6 快照外部阅览时段列与 CHECK / v7 版本原文销毁表与原文列放开 NOT NULL / v8 快照计划撤回表与部分唯一索引
+  models.py     # records / record_versions(原文可销毁) / snapshots(含撤回字段与外部阅览时段) / record_freezes(冻结期) / read_tokens(含换发链) / publish_requests(含冻结时段,冻结原文可销毁) / read_bundles(+requests/items，含换发链) / credential_rotations / read_audit_events(只追加) / sensitive_phrase_settings(启用清单单行) / version_original_destructions(版本原文销毁登记) / withdrawal_schedules(快照计划撤回)
   redaction.py  # 区间校验、合并、替换与敏感短语字面量命中/覆盖核验（纯函数）
-  schemas.py    # 请求/响应模型（含撤回、记录冻结、max_reads、外部阅览时段、多快照共享凭证、泄露换发、读取审计、敏感短语清单与版本原文销毁模型）
+  schemas.py    # 请求/响应模型（含撤回、计划撤回、记录冻结、max_reads、外部阅览时段、多快照共享凭证、泄露换发、读取审计、敏感短语清单与版本原文销毁模型）
   security.py   # 服务密钥与操作者个人凭据（Basic）鉴权、角色依赖
-  config.py     # 环境变量配置（含 REVIEW_CREDENTIALS 校验）
+  config.py     # 环境变量配置（含 REVIEW_CREDENTIALS 校验、计划撤回执行器间隔）
   db.py         # 引擎与会话
 examples/
   demo.sh             # 直接发布端到端调用示例
   demo_controlled.sh  # 受控发布（申请-复核）端到端调用示例
   demo_withdraw.sh    # 快照永久撤回端到端调用示例
+  demo_withdrawal_schedule.sh # 快照计划撤回（安排/查询/取消/到点生效/与手动撤回交互）端到端调用示例
   demo_freeze.sh      # 记录临时冻结（冻结/查询/解除 + 并发边界语义）端到端调用示例
   demo_windows.sh     # 快照外部阅览时段（窗口边界/沿用与冲突/受控拒批/共享凭证逐快照判定）端到端调用示例
   demo_bundles.sh     # 多快照共享凭证（申请-复核 + 共用额度）端到端调用示例
@@ -1166,9 +1269,10 @@ examples/
   demo_destroy.sh     # 历史版本原文销毁（原子清除/幂等回放/销毁后发布与批准拒绝）端到端调用示例
   demo_phrases.sh     # 敏感短语清单维护与发布/申请核验（含并发版本一致性）端到端调用示例
 tests/
-  test_redaction.py       # 脱敏逻辑与敏感短语字面量命中/覆盖核验单元测试
-  test_config.py          # 操作者凭据配置校验单元测试
-  test_integration_api.py # 受控/共享凭证/换发/读取审计/记录冻结/敏感短语清单/历史版本原文销毁/既有接口端到端集成测试（真实 PostgreSQL）
-  test_migrations.py      # 版本化升级流程集成测试（空库/旧库/并发/失败恢复/未知新版本，真实 PostgreSQL）
+  test_redaction.py           # 脱敏逻辑与敏感短语字面量命中/覆盖核验单元测试
+  test_config.py              # 操作者凭据配置校验单元测试
+  test_integration_api.py     # 受控/共享凭证/换发/读取审计/记录冻结/敏感短语清单/历史版本原文销毁/既有接口端到端集成测试（真实 PostgreSQL）
+  test_withdrawal_schedule.py # 快照计划撤回端到端集成测试（提交/幂等/取消/到点生效/执行器/与手动撤回交互，真实 PostgreSQL）
+  test_migrations.py          # 版本化升级流程集成测试（空库/旧库/并发/失败恢复/未知新版本，真实 PostgreSQL）
 Dockerfile / docker-compose.yml
 ```

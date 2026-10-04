@@ -108,6 +108,7 @@ def _make_legacy_v1_schema(engine_) -> None:
         conn.execute(text("ALTER TABLE publish_requests DROP COLUMN token_max_reads"))
         conn.execute(text("DROP TRIGGER IF EXISTS trg_read_audit_events_no_update ON read_audit_events"))
         conn.execute(text("DROP TRIGGER IF EXISTS trg_read_audit_events_no_truncate ON read_audit_events"))
+        conn.execute(text("DROP TABLE IF EXISTS withdrawal_schedules"))
         conn.execute(text("DROP TABLE IF EXISTS schema_migrations"))
 
 
@@ -132,8 +133,8 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
     def test_fresh_database_applies_every_version_in_order(self):
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
         self.assertEqual(previous, 0)
-        self.assertEqual(applied, [1, 2, 3, 4, 5, 6, 7])
-        self.assertEqual(self._versions(), {1, 2, 3, 4, 5, 6, 7})
+        self.assertEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual(self._versions(), {1, 2, 3, 4, 5, 6, 7, 8})
         tables = set(inspect(self.engine).get_table_names())
         self.assertIn("schema_migrations", tables)
         for expected in (
@@ -150,11 +151,18 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
             "record_freezes",
             "sensitive_phrase_settings",
             "version_original_destructions",
+            "withdrawal_schedules",
         ):
             self.assertIn(expected, tables)
         # “每条记录至多一个当前冻结期”的部分唯一索引随 v1 建表即存在
         indexes = {ix["name"] for ix in inspect(self.engine).get_indexes("record_freezes")}
         self.assertIn("uq_record_freezes_active", indexes)
+        # v8：撤回计划表与“每快照至多一个有效计划”的部分唯一索引随 v1 建表即存在
+        schedule_indexes = {
+            ix["name"] for ix in inspect(self.engine).get_indexes("withdrawal_schedules")
+        }
+        self.assertIn("uq_withdrawal_schedules_active", schedule_indexes)
+        self.assertIn("ix_withdrawal_schedules_due", schedule_indexes)
         # v7：版本原文销毁表的 (record_id, version) 唯一索引
         destruction_indexes = {
             ix["name"]
@@ -270,7 +278,7 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
             f"eng = create_engine({self.url!r});"
             "prev, applied = migrations.run_upgrade(eng, connect_retries=1, connect_retry_delay=0);"
             "names = set(inspect(eng).get_table_names());"
-            "assert applied == [1, 2, 3, 4, 5, 6, 7], applied;"
+            "assert applied == [1, 2, 3, 4, 5, 6, 7, 8], applied;"
             "assert 'records' in names and 'read_audit_events' in names, names;"
             "assert 'sensitive_phrase_settings' in names, names;"
             "print('SELF_CONTAINED_OK')"
@@ -421,7 +429,7 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
         # 旧库补登 v1 基线：v1 不重放，只增量执行 v2/v3/v4/v5/v6/v7
         self.assertEqual(previous, 1)
-        self.assertEqual(applied, [2, 3, 4, 5, 6, 7])
+        self.assertEqual(applied, [2, 3, 4, 5, 6, 7, 8])
 
         with self.engine.connect() as conn:
             baseline_name = conn.execute(
@@ -471,6 +479,25 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
                 text("SELECT id, phrases, version FROM sensitive_phrase_settings")
             ).one()
             self.assertEqual((sid, list(phrases), sp_version), (1, [], 1))
+            # v8 在旧库幂等补出撤回计划表与部分唯一索引；既有快照没有任何计划
+            self.assertTrue(
+                conn.execute(
+                    text("SELECT to_regclass('withdrawal_schedules') IS NOT NULL")
+                ).scalar()
+            )
+            self.assertTrue(
+                conn.execute(
+                    text(
+                        "SELECT to_regclass('uq_withdrawal_schedules_active') IS NOT NULL"
+                    )
+                ).scalar()
+            )
+            self.assertEqual(
+                conn.execute(
+                    text("SELECT count(*) FROM withdrawal_schedules")
+                ).scalar_one(),
+                0,
+            )
 
         # 记录与快照保留：旧记录默认非受控，旧快照默认未撤回、仍可读取
         SessionLocal.configure(bind=self.engine)
@@ -520,6 +547,7 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
         with self.engine.begin() as conn:
             Base.metadata.create_all(bind=conn)
             # 模拟 v2 已应用、v3 之前的库：结构齐全，但无版本表、无防改写触发器
+            conn.execute(text("DROP TABLE IF EXISTS withdrawal_schedules"))
             conn.execute(text("DROP TABLE IF EXISTS schema_migrations"))
             conn.execute(text("DROP TRIGGER IF EXISTS trg_read_audit_events_no_update ON read_audit_events"))
             conn.execute(text("DROP TRIGGER IF EXISTS trg_read_audit_events_no_truncate ON read_audit_events"))
@@ -548,7 +576,7 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
             )
 
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
-        self.assertEqual((previous, applied), (1, [2, 3, 4, 5, 6, 7]))
+        self.assertEqual((previous, applied), (1, [2, 3, 4, 5, 6, 7, 8]))
         with self.engine.connect() as conn:
             reads_used, chain_id, rotated = conn.execute(
                 text(
@@ -635,7 +663,7 @@ class NewerAndFailureHandlingTests(unittest.TestCase):
         migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
         # 回到“只完成 v1”的状态，让升级重新尝试 v2
         with self.engine.begin() as conn:
-            conn.execute(text("DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7)"))
+            conn.execute(text("DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8)"))
             conn.execute(
                 text(
                     "DROP TRIGGER IF EXISTS trg_read_audit_events_no_update "
@@ -691,13 +719,13 @@ class NewerAndFailureHandlingTests(unittest.TestCase):
             self.engine, connect_retries=1, connect_retry_delay=0
         )
         self.assertEqual(previous, 1)
-        self.assertEqual(applied, [2, 3, 4, 5, 6, 7])
+        self.assertEqual(applied, [2, 3, 4, 5, 6, 7, 8])
         with self.engine.connect() as conn:
             versions = {
                 row[0]
                 for row in conn.execute(text("SELECT version FROM schema_migrations"))
             }
-        self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7})
+        self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7, 8})
         # v4 收敛出冻结表与部分唯一索引
         with self.engine.connect() as conn:
             freeze_table = conn.execute(
@@ -772,7 +800,7 @@ class ConcurrentStartupTests(unittest.TestCase):
         self.assertTrue(all(isinstance(r, tuple) for r in results), results)
         # 恰好一个实例真正执行了 [1,2,3,4,5]，其余 applied 为空
         applied_lists = [applied for _, applied in results]
-        self.assertEqual(sorted(applied_lists, key=len, reverse=True)[0], [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(sorted(applied_lists, key=len, reverse=True)[0], [1, 2, 3, 4, 5, 6, 7, 8])
         self.assertTrue(all(applied == [] for applied in applied_lists[1:]), applied_lists)
         with self.engine.connect() as conn:
             versions = [
@@ -781,7 +809,7 @@ class ConcurrentStartupTests(unittest.TestCase):
                     text("SELECT version FROM schema_migrations ORDER BY version")
                 )
             ]
-        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8])
 
     def test_advisory_lock_key_is_stable(self):
         # 锁键固定：各实例竞争的是同一把集群级锁
